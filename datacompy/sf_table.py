@@ -24,15 +24,45 @@ import logging
 import os
 from typing import Any, Dict, List, Optional, Union, cast
 
-import numpy as np
 import pandas as pd
 import snowflake.snowpark as sp
-import snowflake.snowpark.functions as spf
 from ordered_set import OrderedSet
+from snowflake.snowpark.functions import (
+    abs,
+    array_contains,
+    col,
+    is_null,
+    lit,
+    monotonically_increasing_id,
+    row_number,
+    trim,
+    upper,
+    when,
+)
 
 from datacompy.base import BaseCompare
 
 LOG = logging.getLogger(__name__)
+
+
+# Used for checking equality with decimal(X, Y) types. Otherwise treated as the string "decimal".
+def decimal_comparator():
+    class DecimalComparator(str):
+        def __eq__(self, other):
+            return len(other) >= 7 and other[0:7] == "decimal"
+
+    return DecimalComparator("decimal")
+
+
+NUMERIC_SPARK_TYPES = [
+    "tinyint",
+    "smallint",
+    "int",
+    "bigint",
+    "float",
+    "double",
+    decimal_comparator(),
+]
 
 
 class TableCompare(BaseCompare):
@@ -98,14 +128,14 @@ class TableCompare(BaseCompare):
         self.session = session
         self.df1 = df1
         self.df2 = df2
-        self.df1_name = self.df1.table_name
-        self.df2_name = self.df2.table_name
+        self.df1_name = self.df1.table_name.replace(".", "_").upper()
+        self.df2_name = self.df2.table_name.replace(".", "_").upper()
         self.abs_tol = abs_tol
         self.rel_tol = rel_tol
         self.ignore_spaces = ignore_spaces
-        self.df1_unq_rows: pd.DataFrame
-        self.df2_unq_rows: pd.DataFrame
-        self.intersect_rows: pd.DataFrame
+        self.df1_unq_rows: sp.DataFrame
+        self.df2_unq_rows: sp.DataFrame
+        self.intersect_rows: sp.DataFrame
         self.column_stats: List[Dict[str, Any]] = []
         self._compare(ignore_spaces=ignore_spaces)
 
@@ -218,25 +248,31 @@ class TableCompare(BaseCompare):
                 if self.df2[column].dtype.kind == "O":
                     self.df2[column] = self.df2[column].str.strip()
 
-        outer_join = self.df1.with_column("merge", spf.lit(True)).join(
-            self.df2.with_column("merge", spf.lit(True)),
+        outer_join = self.df1.with_column("merge", lit(True)).join(
+            self.df2.with_column("merge", lit(True)),
             on=self.join_columns,
             how="outer",
-            lsuffix="_df1",
-            rsuffix="_df2",
+            lsuffix=f"_{self.df1_name}",
+            rsuffix=f"_{self.df2_name}",
         )
 
         # Create join indicator
         outer_join = outer_join.with_column(
             "_merge",
-            spf.when(outer_join["MERGE_DF1"] & outer_join["MERGE_DF2"], spf.lit("BOTH"))
-            .when(
-                outer_join["MERGE_DF1"] & outer_join["MERGE_DF2"].is_null(),
-                spf.lit("LEFT_ONLY"),
+            when(
+                outer_join[f"MERGE_{self.df1_name}"]
+                & outer_join[f"MERGE_{self.df2_name}"],
+                lit("BOTH"),
             )
             .when(
-                outer_join["MERGE_DF1"].is_null() & outer_join["MERGE_DF2"],
-                spf.lit("RIGHT_ONLY"),
+                outer_join[f"MERGE_{self.df1_name}"]
+                & outer_join[f"MERGE_{self.df2_name}"].is_null(),
+                lit("LEFT_ONLY"),
+            )
+            .when(
+                outer_join[f"MERGE_{self.df1_name}"].is_null()
+                & outer_join[f"MERGE_{self.df2_name}"],
+                lit("RIGHT_ONLY"),
             ),
         )
 
@@ -247,8 +283,8 @@ class TableCompare(BaseCompare):
             self.df2.drop(order_column, axis=1, inplace=True)
 
         # Capitalization required - clean up
-        df1_cols = get_merged_columns(self.df1, outer_join, "_DF1")
-        df2_cols = get_merged_columns(self.df2, outer_join, "_DF2")
+        df1_cols = get_merged_columns(self.df1, outer_join, self.df1_name)
+        df2_cols = get_merged_columns(self.df2, outer_join, self.df2_name)
 
         LOG.debug("Selecting df1 unique rows")
         self.df1_unq_rows = outer_join[outer_join["_merge"] == "LEFT_ONLY"][df1_cols]
@@ -274,32 +310,40 @@ class TableCompare(BaseCompare):
         otherwise.
         """
         LOG.debug("Comparing intersection")
+        max_diff: float
+        null_diff: int
         row_cnt = self.intersect_rows.count()
         for column in self.intersect_columns():
+            col1_dtype, _ = _get_column_dtypes(self.df1, column, column)
+            col2_dtype, _ = _get_column_dtypes(self.df2, column, column)
+
             if column in self.join_columns:
                 match_cnt = row_cnt
                 col_match = ""
-                max_diff = 0.0
+                max_diff = 0
                 null_diff = 0
             else:
-                col_1 = column + "_df1"
-                col_2 = column + "_df2"
+                col_1 = column + "_" + self.df1_name
+                col_2 = column + "_" + self.df2_name
                 col_match = column + "_match"
-                self.intersect_rows[col_match] = columns_equal(
-                    self.intersect_rows[col_1],
-                    self.intersect_rows[col_2],
+                self.intersect_rows = columns_equal(
+                    self.intersect_rows,
+                    col_1,
+                    col_2,
+                    col_match,
                     self.rel_tol,
                     self.abs_tol,
                     ignore_spaces,
                 )
-                match_cnt = self.intersect_rows[col_match].sum()
-                max_diff = calculate_max_diff(
-                    self.intersect_rows[col_1], self.intersect_rows[col_2]
+                match_cnt = (
+                    self.intersect_rows.select(col_match)
+                    .where(col(col_match) == True)  # noqa: E712
+                    .count()
                 )
-                null_diff = (
-                    (self.intersect_rows[col_1].isnull())
-                    ^ (self.intersect_rows[col_2].isnull())
-                ).sum()
+                max_diff = calculate_max_diff(
+                    self.intersect_rows, col_1, col_2, col1_dtype, col2_dtype
+                )
+                null_diff = calculate_null_diff(self.intersect_rows, col_1, col_2)
 
             if row_cnt > 0:
                 match_rate = float(match_cnt) / row_cnt
@@ -313,11 +357,11 @@ class TableCompare(BaseCompare):
                     "match_column": col_match,
                     "match_cnt": match_cnt,
                     "unequal_cnt": row_cnt - match_cnt,
-                    "dtype1": str(self.df1[column].dtype),
-                    "dtype2": str(self.df2[column].dtype),
+                    "dtype1": str(col1_dtype),
+                    "dtype2": str(col2_dtype),
                     "all_match": all(
                         (
-                            self.df1[column].dtype == self.df2[column].dtype,
+                            col1_dtype == col2_dtype,
                             row_cnt == match_cnt,
                         )
                     ),
@@ -349,15 +393,23 @@ class TableCompare(BaseCompare):
         int
             Number of matching rows
         """
+        conditions = []
         match_columns = []
         for column in self.intersect_columns():
             if column not in self.join_columns:
-                match_columns.append(column + "_match")
-        return self.intersect_rows[match_columns].all(axis=1).sum()
+                match_columns.append(column + "_MATCH")
+                conditions.append(f"{column}_MATCH = True")
+        if len(conditions) > 0:
+            match_columns_count = self.intersect_rows.filter(
+                " and ".join(conditions)
+            ).count()
+        else:
+            match_columns_count = 0
+        return match_columns_count
 
     def intersect_rows_match(self) -> bool:
         """Check whether the intersect rows all match"""
-        actual_length = self.intersect_rows.shape[0]
+        actual_length = self.intersect_rows.count()
         return self.count_matching_rows() == actual_length
 
     def matches(self, ignore_extra_columns: bool = False) -> bool:
@@ -405,7 +457,7 @@ class TableCompare(BaseCompare):
 
     def sample_mismatch(
         self, column: str, sample_count: int = 10, for_display: bool = False
-    ) -> pd.DataFrame:
+    ) -> "sp.DataFrame":
         """Returns a sample sub-dataframe which contains the identifying
         columns, and df1 and df2 versions of the column.
 
@@ -421,21 +473,35 @@ class TableCompare(BaseCompare):
 
         Returns
         -------
-        Pandas.DataFrame
+        sp.DataFrame
             A sample of the intersection dataframe, containing only the
             "pertinent" columns, for rows that don't match on the provided
             column.
         """
-        row_cnt = self.intersect_rows.shape[0]
-        col_match = self.intersect_rows[column + "_match"]
-        match_cnt = col_match.sum()
+        row_cnt = self.intersect_rows.count()
+        col_match = self.intersect_rows.select(column + "_match")
+        match_cnt = col_match.where(
+            col(column + "_match") == True  # noqa: E712
+        ).count()
         sample_count = min(sample_count, row_cnt - match_cnt)
-        sample = self.intersect_rows[~col_match].sample(sample_count)
-        return_cols = self.join_columns + [column + "_df1", column + "_df2"]
-        to_return = sample[return_cols]
+        sample = (
+            self.intersect_rows.where(col(column + "_match") == False)  # noqa: E712
+            .drop(column + "_match")
+            .limit(sample_count)
+        )
+
+        for c in self.join_columns:
+            sample = sample.withColumnRenamed(c + "_" + self.df1_name, c)
+
+        return_cols = self.join_columns + [
+            column + "_" + self.df1_name,
+            column + "_" + self.df2_name,
+        ]
+        to_return = sample.select(return_cols)
+
         if for_display:
-            to_return.columns = pd.Index(
-                self.join_columns
+            return to_return.toDF(
+                *self.join_columns
                 + [
                     column + " (" + self.df1_name + ")",
                     column + " (" + self.df2_name + ")",
@@ -443,7 +509,7 @@ class TableCompare(BaseCompare):
             )
         return to_return
 
-    def all_mismatch(self, ignore_matching_cols: bool = False) -> pd.DataFrame:
+    def all_mismatch(self, ignore_matching_cols: bool = False) -> "sp.DataFrame":
         """All rows with any columns that have a mismatch. Returns all df1 and df2 versions of the columns and join
         columns.
 
@@ -454,36 +520,53 @@ class TableCompare(BaseCompare):
 
         Returns
         -------
-        Pandas.DataFrame
+        sp.DataFrame
             All rows of the intersection dataframe, containing any columns, that don't match.
         """
         match_list = []
         return_list = []
-        for col in self.intersect_rows.columns:
-            if col.endswith("_match"):
-                orig_col_name = col[:-6]
+        for c in self.intersect_rows.columns:
+            if c.endswith("_match"):
+                orig_col_name = c[:-6]
 
                 col_comparison = columns_equal(
-                    self.intersect_rows[orig_col_name + "_df1"],
-                    self.intersect_rows[orig_col_name + "_df2"],
+                    self.intersect_rows,
+                    orig_col_name + "_" + self.df1_name,
+                    orig_col_name + "_" + self.df2_name,
+                    c,
                     self.rel_tol,
                     self.abs_tol,
                     self.ignore_spaces,
                 )
 
                 if not ignore_matching_cols or (
-                    ignore_matching_cols and not col_comparison.all()
+                    ignore_matching_cols
+                    and col_comparison.select(c)
+                    .where(col(c) == False)  # noqa: E712
+                    .count()
+                    > 0
                 ):
                     LOG.debug(f"Adding column {orig_col_name} to the result.")
-                    match_list.append(col)
-                    return_list.extend([orig_col_name + "_df1", orig_col_name + "_df2"])
+                    match_list.append(c)
+                    return_list.extend(
+                        [
+                            orig_col_name + "_" + self.df1_name,
+                            orig_col_name + "_" + self.df2_name,
+                        ]
+                    )
                 elif ignore_matching_cols:
                     LOG.debug(
                         f"Column {orig_col_name} is equal in df1 and df2. It will not be added to the result."
                     )
 
-        mm_bool = self.intersect_rows[match_list].all(axis="columns")
-        return self.intersect_rows[~mm_bool][self.join_columns + return_list]
+        mm_rows = self.intersect_rows.withColumn(
+            "match_array", array(match_list)
+        ).where(array_contains("match_array", False))
+
+        for c in self.join_columns:
+            mm_rows = mm_rows.withColumnRenamed(c + "_" + self.df1_name, c)
+
+        return mm_rows.select(self.join_columns + return_list)
 
     def report(
         self,
@@ -510,18 +593,13 @@ class TableCompare(BaseCompare):
         str
             The report, formatted kinda nicely.
         """
-
-        def df_to_str(pdf: pd.DataFrame) -> str:
-            pdf = pdf.reset_index(drop=True)
-            return pdf.to_string()
-
         # Header
         report = render("header.txt")
         df_header = pd.DataFrame(
             {
                 "DataFrame": [self.df1_name, self.df2_name],
-                "Columns": [self.df1.shape[1], self.df2.shape[1]],
-                "Rows": [self.df1.shape[0], self.df2.shape[0]],
+                "Columns": [len(self.df1.columns), len(self.df2.columns)],
+                "Rows": [self.df1.count(), self.df2.count()],
             }
         )
         report += df_header[["DataFrame", "Columns", "Rows"]].to_string()
@@ -544,10 +622,10 @@ class TableCompare(BaseCompare):
             match_on,
             self.abs_tol,
             self.rel_tol,
-            self.intersect_rows.shape[0],
-            self.df1_unq_rows.shape[0],
-            self.df2_unq_rows.shape[0],
-            self.intersect_rows.shape[0] - self.count_matching_rows(),
+            self.intersect_rows.count(),
+            self.df1_unq_rows.count(),
+            self.df2_unq_rows.count(),
+            self.intersect_rows.count() - self.count_matching_rows(),
             self.count_matching_rows(),
             self.df1_name,
             self.df2_name,
@@ -609,10 +687,10 @@ class TableCompare(BaseCompare):
                 report += "-------------------------------\n"
                 report += "\n"
                 for sample in match_sample:
-                    report += df_to_str(sample)
+                    report += sample.toPandas().to_string()
                     report += "\n\n"
 
-        if min(sample_count, self.df1_unq_rows.shape[0]) > 0:
+        if min(sample_count, self.df1_unq_rows.count()) > 0:
             report += (
                 f"Sample Rows Only in {self.df1_name} (First {column_count} Columns)\n"
             )
@@ -621,11 +699,16 @@ class TableCompare(BaseCompare):
             )
             report += "\n"
             columns = self.df1_unq_rows.columns[:column_count]
-            unq_count = min(sample_count, self.df1_unq_rows.shape[0])
-            report += df_to_str(self.df1_unq_rows.sample(unq_count)[columns])
+            unq_count = min(sample_count, self.df1_unq_rows.count())
+            report += (
+                self.df1_unq_rows.limit(unq_count)
+                .select(columns)
+                .toPandas()
+                .to_string()
+            )
             report += "\n\n"
 
-        if min(sample_count, self.df2_unq_rows.shape[0]) > 0:
+        if min(sample_count, self.df2_unq_rows.count()) > 0:
             report += (
                 f"Sample Rows Only in {self.df2_name} (First {column_count} Columns)\n"
             )
@@ -634,8 +717,13 @@ class TableCompare(BaseCompare):
             )
             report += "\n"
             columns = self.df2_unq_rows.columns[:column_count]
-            unq_count = min(sample_count, self.df2_unq_rows.shape[0])
-            report += df_to_str(self.df2_unq_rows.sample(unq_count)[columns])
+            unq_count = min(sample_count, self.df2_unq_rows.count())
+            report += (
+                self.df2_unq_rows.limit(unq_count)
+                .select(columns)
+                .toPandas()
+                .to_string()
+            )
             report += "\n\n"
 
         if html_file:
@@ -670,12 +758,14 @@ def render(filename: str, *fields: Union[int, float, str]) -> str:
 
 
 def columns_equal(
-    col_1: "pd.Series[Any]",
-    col_2: "pd.Series[Any]",
+    dataframe: sp.DataFrame,
+    col_1: str,
+    col_2: str,
+    col_match: str,
     rel_tol: float = 0,
     abs_tol: float = 0,
     ignore_spaces: bool = False,
-) -> "pd.Series[bool]":
+) -> sp.DataFrame:
     """Compares two columns from a dataframe, returning a True/False series,
     with the same index as column 1.
 
@@ -689,10 +779,14 @@ def columns_equal(
 
     Parameters
     ----------
-    col_1 : Pandas.Series
+    dataframe: sp.DataFrame
+        DataFrame to do comparison on
+    col_1 : str
         The first column to look at
-    col_2 : Pandas.Series
+    col_2 : str
         The second column
+    col_match : str
+        The matching column denoting if the compare was a match or not
     rel_tol : float, optional
         Relative tolerance
     abs_tol : float, optional
@@ -702,45 +796,49 @@ def columns_equal(
 
     Returns
     -------
-    pandas.Series
-        A series of Boolean values.  True == the values match, False == the
+    sp.DataFrame
+        A column of boolean values are added.  True == the values match, False == the
         values don't match.
     """
-    compare: pd.Series[bool]
-    try:
-        compare = pd.Series(
-            np.isclose(col_1, col_2, rtol=rel_tol, atol=abs_tol, equal_nan=True)
-        )
-    except TypeError:
-        try:
-            compare = pd.Series(
-                np.isclose(
-                    col_1.astype(float),
-                    col_2.astype(float),
-                    rtol=rel_tol,
-                    atol=abs_tol,
-                    equal_nan=True,
-                )
+    base_dtype, compare_dtype = _get_column_dtypes(dataframe, col_1, col_2)
+    if _is_comparable(base_dtype, compare_dtype):
+        if (base_dtype in NUMERIC_SPARK_TYPES) and (
+            compare_dtype in NUMERIC_SPARK_TYPES
+        ):  # numeric tolerance comparison
+            dataframe = dataframe.withColumn(
+                col_match,
+                when(
+                    (col(col_1).eqNullSafe(col(col_2)))
+                    | (
+                        abs(col(col_1) - col(col_2))
+                        <= lit(abs_tol) + (lit(rel_tol) * abs(col(col_2)))
+                    ),
+                    # corner case of col1 != NaN and col2 == Nan returns True incorrectly
+                    when(
+                        (is_null(col(col_1)) == False)  # noqa: E712
+                        & (is_null(col(col_2)) == True),  # noqa: E712
+                        lit(False),
+                    ).otherwise(lit(True)),
+                ).otherwise(lit(False)),
             )
-        except (ValueError, TypeError):
-            try:
-                if ignore_spaces:
-                    if col_1.dtype.kind == "O":
-                        col_1 = col_1.str.strip()
-                    if col_2.dtype.kind == "O":
-                        col_2 = col_2.str.strip()
+        else:  # non-numeric comparison
+            if ignore_spaces:
+                when_clause = trim(col(col_1)).eqNullSafe(trim(col(col_2)))
+            else:
+                when_clause = col(col_1).eqNullSafe(col(col_2))
 
-                if {col_1.dtype.kind, col_2.dtype.kind} == {"M", "O"}:
-                    compare = compare_string_and_date_columns(col_1, col_2)
-                else:
-                    compare = pd.Series(
-                        (col_1 == col_2) | (col_1.isnull() & col_2.isnull())
-                    )
-            except:
-                # Blanket exception should just return all False
-                compare = pd.Series(False, index=col_1.index)
-    compare.index = col_1.index
-    return compare
+            dataframe = dataframe.withColumn(
+                col_match,
+                when(when_clause, lit(True)).otherwise(lit(False)),
+            )
+    else:
+        LOG.debug(
+            "Skipping {}({}) and {}({}), columns are not comparable".format(
+                col_1, base_dtype, col_2, compare_dtype
+            )
+        )
+        dataframe = dataframe.withColumn(col_match, lit(False))
+    return dataframe
 
 
 def compare_string_and_date_columns(
@@ -785,7 +883,7 @@ def compare_string_and_date_columns(
 
 
 def get_merged_columns(
-    original_df: pd.DataFrame, merged_df: pd.DataFrame, suffix: str
+    original_df: sp.DataFrame, merged_df: sp.DataFrame, suffix: str
 ) -> List[str]:
     """Gets the columns from an original dataframe, in the new merged dataframe
 
@@ -803,14 +901,14 @@ def get_merged_columns(
     for col in original_df.columns:
         if col in merged_df.columns:
             columns.append(col)
-        elif col + suffix in merged_df.columns:
-            columns.append(col + suffix)
+        elif f"{col}_{suffix}" in merged_df.columns:
+            columns.append(f"{col}_{suffix}")
         else:
             raise ValueError("Column not found: %s", col)
     return columns
 
 
-def temp_column_name(*dataframes: pd.DataFrame) -> str:
+def temp_column_name(*dataframes: sp.DataFrame) -> str:
     """Gets a temp column name that isn't included in columns of any dataframes
 
     Parameters
@@ -835,55 +933,191 @@ def temp_column_name(*dataframes: pd.DataFrame) -> str:
             return temp_column
 
 
-def calculate_max_diff(col_1: "pd.Series[Any]", col_2: "pd.Series[Any]") -> float:
+def calculate_max_diff(
+    dataframe: "sp.DataFrame", col_1: str, col_2: str, type1: str, type2: str
+) -> float:
     """Get a maximum difference between two columns
 
     Parameters
     ----------
-    col_1 : Pandas.Series
-        The first column
-    col_2 : Pandas.Series
+    dataframe: sp.DataFrame
+        DataFrame to do comparison on
+    col_1 : str
+        The first column to look at
+    col_2 : str
+        The second column
+    type_1: str
+        The type of the first column
+    type_2: str
+        The type of the second column
+
+    Returns
+    -------
+    float
+        max diff
+    """
+    if not (type1 in NUMERIC_SPARK_TYPES and type2 in NUMERIC_SPARK_TYPES):
+        return 0
+
+    diff = dataframe.select(
+        (col(col_1).astype("float") - col(col_2).astype("float")).alias("diff")
+    )
+    abs_diff = diff.select(abs(col("diff")).alias("abs_diff"))
+    max_diff: float = (
+        abs_diff.where(is_null(col("abs_diff")) == False)  # noqa: E712
+        .agg({"abs_diff": "max"})
+        .collect()[0][0]
+    )
+
+    if pd.isna(max_diff) or pd.isnull(max_diff) or max_diff is None:
+        return 0
+    else:
+        return max_diff
+
+
+def calculate_null_diff(dataframe: "sp.DataFrame", col_1: str, col_2: str) -> int:
+    """Get the null differences between two columns
+
+    Parameters
+    ----------
+    dataframe: sp.DataFrame
+        DataFrame to do comparison on
+    col_1 : str
+        The first column to look at
+    col_2 : str
         The second column
 
     Returns
     -------
-    Numeric
-        Numeric field, or zero.
+    int
+        null diff
     """
-    try:
-        return cast(float, (col_1.astype(float) - col_2.astype(float)).abs().max())
-    except:
-        return 0.0
+    nulls_df = dataframe.withColumn(
+        "col_1_null",
+        when(col(col_1).isNull() == True, lit(True)).otherwise(  # noqa: E712
+            lit(False)
+        ),
+    )
+    nulls_df = nulls_df.withColumn(
+        "col_2_null",
+        when(col(col_2).isNull() == True, lit(True)).otherwise(  # noqa: E712
+            lit(False)
+        ),
+    ).select(["col_1_null", "col_2_null"])
+
+    # (not a and b) or (a and not b)
+    null_diff = nulls_df.where(
+        ((col("col_1_null") == False) & (col("col_2_null") == True))  # noqa: E712
+        | ((col("col_1_null") == True) & (col("col_2_null") == False))  # noqa: E712
+    ).count()
+
+    if pd.isna(null_diff) or pd.isnull(null_diff) or null_diff is None:
+        return 0
+    else:
+        return null_diff
 
 
-def generate_id_within_group(
-    dataframe: pd.DataFrame, join_columns: List[str]
-) -> "pd.Series[int]":
+def _generate_id_within_group(
+    dataframe: "sp.DataFrame", join_columns: List[str], order_column_name: str
+) -> "sp.DataFrame":
     """Generate an ID column that can be used to deduplicate identical rows.  The series generated
-    is the order within a unique group, and it handles nulls.
+    is the order within a unique group, and it handles nulls. Requires a ``__index`` column.
 
     Parameters
     ----------
-    dataframe : Pandas.DataFrame
+    dataframe : sp.DataFrame
         The dataframe to operate on
     join_columns : list
         List of strings which are the join columns
+    order_column_name: str
+        The name of the ``row_number`` column name
 
     Returns
     -------
-    Pandas.Series
-        The ID column that's unique in each group.
+    sp.DataFrame
+        Original dataframe with the ID column that's unique in each group
     """
     default_value = "DATACOMPY_NULL"
-    if dataframe[join_columns].isnull().any().any():
-        if (dataframe[join_columns] == default_value).any().any():
+    null_cols = [f"any(isnull({c}))" for c in join_columns]
+    default_cols = [f"any({c} == '{default_value}')" for c in join_columns]
+
+    null_check = any(list(dataframe.selectExpr(null_cols).first()))
+    default_check = any(list(dataframe.selectExpr(default_cols).first()))
+
+    if null_check:
+        if default_check:
             raise ValueError(f"{default_value} was found in your join columns")
+
         return (
-            dataframe[join_columns]
-            .astype(str)
+            dataframe.select(
+                *(col(c).cast("string").alias(c) for c in join_columns + ["__index"])
+            )
             .fillna(default_value)
-            .groupby(join_columns)
-            .cumcount()
+            .withColumn(
+                order_column_name,
+                row_number().over(Window.orderBy("__index").partitionBy(join_columns))
+                - 1,
+            )
+            .select(["__index", order_column_name])
         )
     else:
-        return dataframe[join_columns].groupby(join_columns).cumcount()
+        return (
+            dataframe.select(join_columns + ["__index"])
+            .withColumn(
+                order_column_name,
+                row_number().over(Window.orderBy("__index").partitionBy(join_columns))
+                - 1,
+            )
+            .select(["__index", order_column_name])
+        )
+
+
+def _get_column_dtypes(
+    dataframe: "sp.DataFrame", col_1: "str", col_2: "str"
+) -> tuple[str, str]:
+    """Get the dtypes of two columns
+
+    Parameters
+    ----------
+    dataframe: sp.DataFrame
+        DataFrame to do comparison on
+    col_1 : str
+        The first column to look at
+    col_2 : str
+        The second column
+
+    Returns
+    -------
+    Tuple(str, str)
+        Tuple of base and compare datatype
+    """
+    base_dtype = [d[1] for d in dataframe.dtypes if d[0] == col_1][0]
+    compare_dtype = [d[1] for d in dataframe.dtypes if d[0] == col_2][0]
+    return base_dtype, compare_dtype
+
+
+def _is_comparable(type1: str, type2: str) -> bool:
+    """Checks if two Spark data types can be safely compared.
+
+    Two data types are considered comparable if any of the following apply:
+        1. Both data types are the same
+        2. Both data types are numeric
+
+    Parameters
+    ----------
+    type1 : str
+        A string representation of a Spark data type
+    type2 : str
+        A string representation of a Spark data type
+
+    Returns
+    -------
+    bool
+        True if both data types are comparable
+    """
+    return (
+        type1 == type2
+        or (type1 in NUMERIC_SPARK_TYPES and type2 in NUMERIC_SPARK_TYPES)
+        or ({type1, type2} == {"string", "timestamp"})
+        or ({type1, type2} == {"string", "date"})
+    )
