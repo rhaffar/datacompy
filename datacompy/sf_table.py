@@ -290,7 +290,9 @@ class TableCompare(BaseCompare):
 
         # Clean up temp columns for duplicate row matching
         if self._any_dupes:
-            outer_join = outer_join.drop(order_column)
+            outer_join = outer_join.select_expr(
+                f"* EXCLUDE ({order_column}_{self.df1_name}, {order_column}_{self.df2_name})"
+            )
             df1 = df1.drop(order_column)
             df2 = df2.drop(order_column)
 
