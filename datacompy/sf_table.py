@@ -22,11 +22,13 @@ two dataframes.
 """
 import logging
 import os
+from copy import deepcopy
 from typing import Any, Dict, List, Optional, Union, cast
 
 import pandas as pd
 import snowflake.snowpark as sp
 from ordered_set import OrderedSet
+from snowflake.snowpark import Window
 from snowflake.snowpark.functions import (
     abs,
     array_contains,
@@ -227,29 +229,39 @@ class TableCompare(BaseCompare):
         Joins on the ``join_columns``.
         """
         LOG.debug("Outer joining")
+
+        df1 = self.df1
+        df2 = self.df2
+        temp_join_columns = deepcopy(self.join_columns)
+
         if self._any_dupes:
             LOG.debug("Duplicate rows found, deduping by order of remaining fields")
-            temp_join_columns = list(self.join_columns)
+            # setting internal index
+            LOG.info("Adding internal index to dataframes")
+            df1 = df1.withColumn("__index", monotonically_increasing_id())
+            df2 = df2.withColumn("__index", monotonically_increasing_id())
 
             # Create order column for uniqueness of match
-            order_column = temp_column_name(self.df1, self.df2)
-            self.df1[order_column] = generate_id_within_group(
-                self.df1, temp_join_columns
-            )
-            self.df2[order_column] = generate_id_within_group(
-                self.df2, temp_join_columns
-            )
+            order_column = temp_column_name(df1, df2)
+            df1 = df1.join(
+                _generate_id_within_group(df1, temp_join_columns, order_column),
+                on="__index",
+                how="inner",
+            ).drop("__index")
+            df2 = df2.join(
+                _generate_id_within_group(df2, temp_join_columns, order_column),
+                on="__index",
+                how="inner",
+            ).drop("__index")
             temp_join_columns.append(order_column)
 
-        if ignore_spaces:
-            for column in self.join_columns:
-                if self.df1[column].dtype.kind == "O":
-                    self.df1[column] = self.df1[column].str.strip()
-                if self.df2[column].dtype.kind == "O":
-                    self.df2[column] = self.df2[column].str.strip()
+            # drop index
+            LOG.info("Dropping internal index")
+            df1 = df1.drop("__index")
+            df2 = df2.drop("__index")
 
-        outer_join = self.df1.with_column("merge", lit(True)).join(
-            self.df2.with_column("merge", lit(True)),
+        outer_join = df1.with_column("merge", lit(True)).join(
+            df2.with_column("merge", lit(True)),
             on=self.join_columns,
             how="outer",
             lsuffix=f"_{self.df1_name}",
@@ -278,21 +290,21 @@ class TableCompare(BaseCompare):
 
         # Clean up temp columns for duplicate row matching
         if self._any_dupes:
-            outer_join.drop(labels=order_column, axis=1, inplace=True)
-            self.df1.drop(order_column, axis=1, inplace=True)
-            self.df2.drop(order_column, axis=1, inplace=True)
+            outer_join = outer_join.drop(order_column)
+            df1 = df1.drop(order_column)
+            df2 = df2.drop(order_column)
 
         # Capitalization required - clean up
-        df1_cols = get_merged_columns(self.df1, outer_join, self.df1_name)
-        df2_cols = get_merged_columns(self.df2, outer_join, self.df2_name)
+        df1_cols = get_merged_columns(df1, outer_join, self.df1_name)
+        df2_cols = get_merged_columns(df2, outer_join, self.df2_name)
 
         LOG.debug("Selecting df1 unique rows")
         self.df1_unq_rows = outer_join[outer_join["_merge"] == "LEFT_ONLY"][df1_cols]
-        self.df1_unq_rows.rename(dict(zip(self.df1_unq_rows.columns, self.df1.columns)))
+        self.df1_unq_rows.rename(dict(zip(self.df1_unq_rows.columns, df1.columns)))
 
         LOG.debug("Selecting df2 unique rows")
         self.df2_unq_rows = outer_join[outer_join["_merge"] == "RIGHT_ONLY"][df2_cols]
-        self.df2_unq_rows.rename(dict(zip(self.df2_unq_rows.columns, self.df2.columns)))
+        self.df2_unq_rows.rename(dict(zip(self.df2_unq_rows.columns, df2.columns)))
         LOG.info(f"Number of rows in df1 and not in df2: {self.df1_unq_rows.count()}")
         LOG.info(f"Number of rows in df2 and not in df1: {self.df2_unq_rows.count()}")
 
@@ -489,9 +501,6 @@ class TableCompare(BaseCompare):
             .drop(column + "_match")
             .limit(sample_count)
         )
-
-        for c in self.join_columns:
-            sample = sample.withColumnRenamed(c + "_" + self.df1_name, c)
 
         return_cols = self.join_columns + [
             column + "_" + self.df1_name,
@@ -841,47 +850,6 @@ def columns_equal(
     return dataframe
 
 
-def compare_string_and_date_columns(
-    col_1: "pd.Series[Any]", col_2: "pd.Series[Any]"
-) -> "pd.Series[bool]":
-    """Compare a string column and date column, value-wise.  This tries to
-    convert a string column to a date column and compare that way.
-
-    Parameters
-    ----------
-    col_1 : Pandas.Series
-        The first column to look at
-    col_2 : Pandas.Series
-        The second column
-
-    Returns
-    -------
-    pandas.Series
-        A series of Boolean values.  True == the values match, False == the
-        values don't match.
-    """
-    if col_1.dtype.kind == "O":
-        obj_column = col_1
-        date_column = col_2
-    else:
-        obj_column = col_2
-        date_column = col_1
-
-    try:
-        return pd.Series(
-            (pd.to_datetime(obj_column) == date_column)
-            | (obj_column.isnull() & date_column.isnull())
-        )
-    except:
-        try:
-            return pd.Series(
-                (pd.to_datetime(obj_column, format="mixed") == date_column)
-                | (obj_column.isnull() & date_column.isnull())
-            )
-        except:
-            return pd.Series(False, index=col_1.index)
-
-
 def get_merged_columns(
     original_df: sp.DataFrame, merged_df: sp.DataFrame, suffix: str
 ) -> List[str]:
@@ -1038,11 +1006,18 @@ def _generate_id_within_group(
         Original dataframe with the ID column that's unique in each group
     """
     default_value = "DATACOMPY_NULL"
-    null_cols = [f"any(isnull({c}))" for c in join_columns]
-    default_cols = [f"any({c} == '{default_value}')" for c in join_columns]
-
-    null_check = any(list(dataframe.selectExpr(null_cols).first()))
-    default_check = any(list(dataframe.selectExpr(default_cols).first()))
+    null_check = False
+    default_check = False
+    for c in join_columns:
+        if dataframe.where(col(c).isNull()).limit(1).collect():
+            null_check = True
+            break
+    for c in [
+        column for column, type in dataframe[join_columns].dtypes if "string" in type
+    ]:
+        if dataframe.where(col(c).isin(default_value)).limit(1).collect():
+            default_check = True
+            break
 
     if null_check:
         if default_check:
