@@ -38,7 +38,6 @@ from snowflake.snowpark.functions import (
     monotonically_increasing_id,
     row_number,
     trim,
-    upper,
     when,
 )
 
