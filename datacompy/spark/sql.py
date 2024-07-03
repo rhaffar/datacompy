@@ -394,6 +394,9 @@ class SparkSQLCompare(BaseCompare):
             .otherwise("both"),
         )
 
+        df1 = df1.drop("_merge_left")
+        df1 = df2.drop("_merge_right")
+
         # Clean up temp columns for duplicate row matching
         if self._any_dupes:
             outer_join = outer_join.drop(

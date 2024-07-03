@@ -260,6 +260,19 @@ class TableCompare(BaseCompare):
             df1 = df1.drop("__index")
             df2 = df2.drop("__index")
 
+        if ignore_spaces:
+            for column in self.join_columns:
+                if (
+                    "string"
+                    in [dtype for name, dtype in df1.dtypes if name == column][0]
+                ):
+                    df1 = df1.withColumn(column, trim(col(column)))
+                if (
+                    "string"
+                    in [dtype for name, dtype in df2.dtypes if name == column][0]
+                ):
+                    df2 = df2.withColumn(column, trim(col(column)))
+
         outer_join = df1.with_column("merge", lit(True)).join(
             df2.with_column("merge", lit(True)),
             on=self.join_columns,
@@ -397,7 +410,7 @@ class TableCompare(BaseCompare):
             True if all rows in df1 are in df2 and vice versa (based on
             existence for join option)
         """
-        return len(self.df1_unq_rows) == len(self.df2_unq_rows) == 0
+        return self.df1_unq_rows.count() == self.df2_unq_rows.count() == 0
 
     def count_matching_rows(self) -> int:
         """Count the number of rows match (on overlapping fields)
@@ -1095,6 +1108,8 @@ def _is_comparable(type1: str, type2: str) -> bool:
     return (
         type1 == type2
         or (type1 in NUMERIC_SPARK_TYPES and type2 in NUMERIC_SPARK_TYPES)
-        or ({type1, type2} == {"string", "timestamp"})
-        or ({type1, type2} == {"string", "date"})
+        or ("string" in type1 and type2 == "date")
+        or (type1 == "date" and "string" in type2)
+        or ("string" in type1 and type2 == "timestamp")
+        or (type1 == "timestamp" and "string" in type2)
     )
