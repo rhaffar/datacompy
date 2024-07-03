@@ -273,14 +273,31 @@ class TableCompare(BaseCompare):
                 ):
                     df2 = df2.withColumn(column, trim(col(column)))
 
-        outer_join = df1.with_column("merge", lit(True)).join(
-            df2.with_column("merge", lit(True)),
-            on=self.join_columns,
-            how="outer",
-            lsuffix=f"_{self.df1_name}",
-            rsuffix=f"_{self.df2_name}",
-        )
+        df1 = df1.with_column("merge", lit(True))
+        df2 = df2.with_column("merge", lit(True))
 
+        for c in df1.columns:
+            df1 = df1.withColumnRenamed(c, c + "_" + self.df1_name)
+        for c in df2.columns:
+            df2 = df2.withColumnRenamed(c, c + "_" + self.df2_name)
+
+        # NULL SAFE Outer join using ON
+        df1.createOrReplaceTempView("df1")
+        df2.createOrReplaceTempView("df2")
+        on = " and ".join(
+            [
+                f"EQUAL_NULL(df1.{c}_{self.df1_name}, df2.{c}_{self.df2_name})"
+                for c in temp_join_columns
+            ]
+        )
+        outer_join = self.session.sql(
+            """
+        SELECT * FROM
+        df1 FULL OUTER JOIN df2
+        ON     
+        """
+            + on
+        )
         # Create join indicator
         outer_join = outer_join.with_column(
             "_merge",
@@ -301,13 +318,16 @@ class TableCompare(BaseCompare):
             ),
         )
 
+        df1 = df1.drop(f"MERGE_{self.df1_name}")
+        df2 = df2.drop(f"MERGE_{self.df2_name}")
+
         # Clean up temp columns for duplicate row matching
         if self._any_dupes:
             outer_join = outer_join.select_expr(
                 f"* EXCLUDE ({order_column}_{self.df1_name}, {order_column}_{self.df2_name})"
             )
-            df1 = df1.drop(order_column)
-            df2 = df2.drop(order_column)
+            df1 = df1.drop(f"{order_column}_{self.df1_name}")
+            df2 = df2.drop(f"{order_column}_{self.df2_name}")
 
         # Capitalization required - clean up
         df1_cols = get_merged_columns(df1, outer_join, self.df1_name)
@@ -516,6 +536,9 @@ class TableCompare(BaseCompare):
             .drop(column + "_match")
             .limit(sample_count)
         )
+
+        for c in self.join_columns:
+            sample = sample.withColumnRenamed(c + "_" + self.df1_name, c)
 
         return_cols = self.join_columns + [
             column + "_" + self.df1_name,
