@@ -55,7 +55,7 @@ def decimal_comparator():
     return DecimalComparator("decimal")
 
 
-NUMERIC_SPARK_TYPES = [
+NUMERIC_SNOWPARK_TYPES = [
     "tinyint",
     "smallint",
     "int",
@@ -847,8 +847,8 @@ def columns_equal(
     """
     base_dtype, compare_dtype = _get_column_dtypes(dataframe, col_1, col_2)
     if _is_comparable(base_dtype, compare_dtype):
-        if (base_dtype in NUMERIC_SPARK_TYPES) and (
-            compare_dtype in NUMERIC_SPARK_TYPES
+        if (base_dtype in NUMERIC_SNOWPARK_TYPES) and (
+            compare_dtype in NUMERIC_SNOWPARK_TYPES
         ):  # numeric tolerance comparison
             dataframe = dataframe.withColumn(
                 col_match,
@@ -960,7 +960,7 @@ def calculate_max_diff(
     float
         max diff
     """
-    if not (type1 in NUMERIC_SPARK_TYPES and type2 in NUMERIC_SPARK_TYPES):
+    if not (type1 in NUMERIC_SNOWPARK_TYPES and type2 in NUMERIC_SNOWPARK_TYPES):
         return 0
 
     diff = dataframe.select(
@@ -1128,7 +1128,7 @@ def _is_comparable(type1: str, type2: str) -> bool:
     """
     return (
         type1 == type2
-        or (type1 in NUMERIC_SPARK_TYPES and type2 in NUMERIC_SPARK_TYPES)
+        or (type1 in NUMERIC_SNOWPARK_TYPES and type2 in NUMERIC_SNOWPARK_TYPES)
         or ("string" in type1 and type2 == "date")
         or (type1 == "date" and "string" in type2)
         or ("string" in type1 and type2 == "timestamp")
