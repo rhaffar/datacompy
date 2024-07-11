@@ -280,7 +280,7 @@ class TableCompare(BaseCompare):
         for c in df2.columns:
             df2 = df2.withColumnRenamed(c, c + "_" + self.df2_name)
 
-        # NULL SAFE Outer join using ON
+        # NULL SAFE Outer join, not possible with Snowpark Dataframe join
         df1.createOrReplaceTempView("df1")
         df2.createOrReplaceTempView("df2")
         on = " and ".join(
@@ -334,11 +334,9 @@ class TableCompare(BaseCompare):
 
         LOG.debug("Selecting df1 unique rows")
         self.df1_unq_rows = outer_join[outer_join["_merge"] == "LEFT_ONLY"][df1_cols]
-        self.df1_unq_rows.rename(dict(zip(self.df1_unq_rows.columns, df1.columns)))
 
         LOG.debug("Selecting df2 unique rows")
         self.df2_unq_rows = outer_join[outer_join["_merge"] == "RIGHT_ONLY"][df2_cols]
-        self.df2_unq_rows.rename(dict(zip(self.df2_unq_rows.columns, df2.columns)))
         LOG.info(f"Number of rows in df1 and not in df2: {self.df1_unq_rows.count()}")
         LOG.info(f"Number of rows in df2 and not in df1: {self.df2_unq_rows.count()}")
 
@@ -347,6 +345,7 @@ class TableCompare(BaseCompare):
         LOG.info(
             f"Number of rows in df1 and df2 (not necessarily equal): {self.intersect_rows.count()}"
         )
+        self.intersect_rows = self.intersect_rows.cache_result()
 
     def _intersect_compare(self, ignore_spaces: bool) -> None:
         """Run the comparison on the intersect dataframe
