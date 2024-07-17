@@ -31,8 +31,9 @@ from ordered_set import OrderedSet
 from snowflake.snowpark import Window
 from snowflake.snowpark.functions import (
     abs,
-    array_contains,
     col,
+    concat,
+    contains,
     is_null,
     lit,
     monotonically_increasing_id,
@@ -571,7 +572,7 @@ class TableCompare(BaseCompare):
         match_list = []
         return_list = []
         for c in self.intersect_rows.columns:
-            if c.endswith("_match"):
+            if c.endswith("_MATCH"):
                 orig_col_name = c[:-6]
 
                 col_comparison = columns_equal(
@@ -605,8 +606,8 @@ class TableCompare(BaseCompare):
                     )
 
         mm_rows = self.intersect_rows.withColumn(
-            "match_array", array(match_list)
-        ).where(array_contains("match_array", False))
+            "match_array", concat(*match_list)
+        ).where(contains(col("match_array"), lit("false")))
 
         for c in self.join_columns:
             mm_rows = mm_rows.withColumnRenamed(c + "_" + self.df1_name, c)
