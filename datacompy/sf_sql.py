@@ -14,7 +14,7 @@
 # limitations under the License.
 
 """
-Compare two Pandas DataFrames
+Compare two Snowflake Tables
 
 Originally this package was meant to provide similar functionality to
 PROC COMPARE in SAS - i.e. human-readable reporting on the difference between
@@ -29,6 +29,7 @@ import pandas as pd
 import snowflake.snowpark as sp
 from ordered_set import OrderedSet
 from snowflake.snowpark import Window
+from snowflake.snowpark.exceptions import SnowparkSQLException
 from snowflake.snowpark.functions import (
     abs,
     col,
@@ -67,7 +68,7 @@ NUMERIC_SNOWPARK_TYPES = [
 ]
 
 
-class TableCompare(BaseCompare):
+class SFTableCompare(BaseCompare):
     """Comparison class to be used to compare whether two dataframes as equal.
 
     Both df1 and df2 should be dataframes containing all of the join_columns,
@@ -78,10 +79,10 @@ class TableCompare(BaseCompare):
     ----------
     session: snowflake.snowpark.session
         Session with the required connection session info for user and targeted tables
-    df1 : pandas ``DataFrame``
-        First dataframe to check
-    df2 : pandas ``DataFrame``
-        Second dataframe to check
+    df1 : Union[str, sp.Dataframe]
+        First table to check, provided either as the table's name or as a Snowpark DF.
+    df2 : Union[str, sp.Dataframe]
+        Second table to check, provided either as the table's name or as a Snowpark DF.
     join_columns : list or str, optional
         Column(s) to join dataframes on.  If a string is passed in, that one
         column will be used.
@@ -101,17 +102,17 @@ class TableCompare(BaseCompare):
 
     Attributes
     ----------
-    df1_unq_rows : pandas ``DataFrame``
+    df1_unq_rows : sp.DataFrame
         All records that are only in df1 (based on a join on join_columns)
-    df2_unq_rows : pandas ``DataFrame``
+    df2_unq_rows : sp.DataFrame
         All records that are only in df2 (based on a join on join_columns)
     """
 
     def __init__(
         self,
         session: sp.Session,
-        df1: str,
-        df2: str,
+        df1: Union[str, sp.DataFrame],
+        df2: Union[str, sp.DataFrame],
         join_columns: Optional[Union[List[str], str]],
         abs_tol: float = 0,
         rel_tol: float = 0,
@@ -130,8 +131,6 @@ class TableCompare(BaseCompare):
         self.session = session
         self.df1 = df1
         self.df2 = df2
-        self.df1_name = self.df1.table_name.replace(".", "_").upper()
-        self.df2_name = self.df2.table_name.replace(".", "_").upper()
         self.abs_tol = abs_tol
         self.rel_tol = rel_tol
         self.ignore_spaces = ignore_spaces
@@ -142,26 +141,45 @@ class TableCompare(BaseCompare):
         self._compare(ignore_spaces=ignore_spaces)
 
     @property
-    def df1(self) -> sp.Table:
+    def df1(self) -> sp.DataFrame:
         return self._df1
 
     @df1.setter
-    def df1(self, df1: str) -> None:
+    def df1(self, df1: Union[str, sp.DataFrame]) -> None:
         """Check that it is a dataframe and has the join columns"""
-        self._df1 = self.session.table(df1)
-        self._validate_dataframe(self.df1)
+        if isinstance(df1, str):
+            table_name = [table_comp.upper() for table_comp in df1.split(".")]
+            if len(table_name) == 3:
+                self.df1_name = table_name[2]
+            else:
+                errmsg = f"{df1} is not a valid table name."
+                raise ValueError(errmsg)
+            self._df1 = self.session.table(df1)
+        else:
+            self._df1 = df1
+            self.df1_name = "DF1"
+        self._validate_dataframe(self.df1, self.df1_name)
 
     @property
-    def df2(self) -> sp.Table:
+    def df2(self) -> sp.DataFrame:
         return self._df2
 
     @df2.setter
-    def df2(self, df2: str) -> None:
+    def df2(self, df2: Union[str, sp.DataFrame]) -> None:
         """Check that it is a dataframe and has the join columns"""
-        self._df2 = self.session.table(df2)
-        self._validate_dataframe(self.df2)
+        if isinstance(df2, str):
+            self._df2 = self.session.table(df2)
+            try:
+                self.df2_name = self.df2.table_name.split(".")[2].upper()
+            except IndexError as e:
+                errmsg = f"Table {df2.table_name} is not a valid table."
+                raise ValueError(errmsg) from e
+        else:
+            self._df2 = df2
+            self.df2_name = "DF2"
+        self._validate_dataframe(self.df2, self.df2_name)
 
-    def _validate_dataframe(self, df: sp.Table) -> None:
+    def _validate_dataframe(self, df: sp.DataFrame, df_name: str) -> None:
         """Check that it is a dataframe and has the join columns
 
         Parameters
@@ -169,9 +187,13 @@ class TableCompare(BaseCompare):
         df : snowflake.session.Table
             Snowflake Snowpark table object
         """
-        if not isinstance(df, sp.Table):
-            raise TypeError(f"{df.table_name} must be a valid table")
-
+        if not isinstance(df, sp.DataFrame):
+            raise TypeError(f"{df_name} must be a valid sp.Dataframe")
+        try:
+            df.columns
+        except SnowparkSQLException as e:
+            errmsg = f"Table {df.table_name} does not exist."
+            raise ValueError(errmsg) from e
         # Check if join_columns are present in the dataframe
         if not set(self.join_columns).issubset(set(df.columns)):
             raise ValueError(f"{df.table_name} must have all columns from join_columns")
@@ -371,7 +393,7 @@ class TableCompare(BaseCompare):
             else:
                 col_1 = column + "_" + self.df1_name
                 col_2 = column + "_" + self.df2_name
-                col_match = column + "_match"
+                col_match = column + "_MATCH"
                 self.intersect_rows = columns_equal(
                     self.intersect_rows,
                     col_1,
@@ -494,7 +516,7 @@ class TableCompare(BaseCompare):
         """
         if not self.df2_unq_columns() == set():
             return False
-        elif not len(self.df2_unq_rows) == 0:
+        elif not self.df2_unq_rows.count() == 0:
             return False
         elif not self.intersect_rows_match():
             return False
@@ -525,14 +547,14 @@ class TableCompare(BaseCompare):
             column.
         """
         row_cnt = self.intersect_rows.count()
-        col_match = self.intersect_rows.select(column + "_match")
+        col_match = self.intersect_rows.select(column + "_MATCH")
         match_cnt = col_match.where(
-            col(column + "_match") == True  # noqa: E712
+            col(column + "_MATCH") == True  # noqa: E712
         ).count()
         sample_count = min(sample_count, row_cnt - match_cnt)
         sample = (
-            self.intersect_rows.where(col(column + "_match") == False)  # noqa: E712
-            .drop(column + "_match")
+            self.intersect_rows.where(col(column + "_MATCH") == False)  # noqa: E712
+            .drop(column + "_MATCH")
             .limit(sample_count)
         )
 
@@ -894,9 +916,9 @@ def get_merged_columns(
 
     Parameters
     ----------
-    original_df : Pandas.DataFrame
+    original_df : sp.DataFrame
         The original, pre-merge dataframe
-    merged_df : Pandas.DataFrame
+    merged_df : sp.DataFrame
         Post-merge with another dataframe, with suffixes added in.
     suffix : str
         What suffix was used to distinguish when the original dataframe was
@@ -918,7 +940,7 @@ def temp_column_name(*dataframes: sp.DataFrame) -> str:
 
     Parameters
     ----------
-    dataframes : list of Pandas.DataFrame
+    dataframes : list of sp.DataFrame
         The DataFrames to create a temporary column name for
 
     Returns
@@ -927,13 +949,18 @@ def temp_column_name(*dataframes: sp.DataFrame) -> str:
         String column name that looks like '_temp_x' for some integer x
     """
     i = 0
+    columns = []
+    for dataframe in dataframes:
+        columns = columns + list(dataframe.columns)
+    columns = set(columns)
+
     while True:
-        temp_column = f"_temp_{i}"
+        temp_column = f"_TEMP_{i}"
         unique = True
-        for dataframe in dataframes:
-            if temp_column in dataframe.columns:
-                i += 1
-                unique = False
+
+        if temp_column in columns:
+            i += 1
+            unique = False
         if unique:
             return temp_column
 
@@ -961,8 +988,8 @@ def calculate_max_diff(
     float
         max diff
     """
-    if not (type1 in NUMERIC_SNOWPARK_TYPES and type2 in NUMERIC_SNOWPARK_TYPES):
-        return 0
+    # remove or no?    if not (type1 in NUMERIC_SNOWPARK_TYPES and type2 in NUMERIC_SNOWPARK_TYPES):
+    #        return 0
 
     diff = dataframe.select(
         (col(col_1).astype("float") - col(col_2).astype("float")).alias("diff")
@@ -1109,7 +1136,7 @@ def _get_column_dtypes(
 
 
 def _is_comparable(type1: str, type2: str) -> bool:
-    """Checks if two Spark data types can be safely compared.
+    """Checks if two SnowPark data types can be safely compared.
 
     Two data types are considered comparable if any of the following apply:
         1. Both data types are the same
@@ -1118,9 +1145,9 @@ def _is_comparable(type1: str, type2: str) -> bool:
     Parameters
     ----------
     type1 : str
-        A string representation of a Spark data type
+        A string representation of a Snowpark data type
     type2 : str
-        A string representation of a Spark data type
+        A string representation of a Snowpark data type
 
     Returns
     -------

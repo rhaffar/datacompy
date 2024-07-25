@@ -29,6 +29,7 @@ from .fugue import (  # noqa: F401
     unq_columns,
 )
 from .polars import PolarsCompare  # noqa: F401
+from .sf_sql import SFTableCompare
 from .spark.pandas import SparkPandasCompare  # noqa: F401
 from .spark.sql import SparkSQLCompare  # noqa: F401
 
