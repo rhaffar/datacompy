@@ -1078,7 +1078,7 @@ def _generate_id_within_group(
 
         return (
             dataframe.select(
-                *(col(c).cast("string").alias(c) for c in [*join_columns, ["__index"]])
+                *(col(c).cast("string").alias(c) for c in join_columns + ["__index"])  # noqa: RUF005
             )
             .fillna(default_value)
             .withColumn(
