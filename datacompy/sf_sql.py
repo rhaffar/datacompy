@@ -569,22 +569,18 @@ class SFTableCompare(BaseCompare):
             sample = sample.withColumnRenamed(c + "_" + self.df1_name, c)
 
         return_cols = [
-            self.join_columns,
-            *[
-                column + "_" + self.df1_name,
-                column + "_" + self.df2_name,
-            ],
+            *self.join_columns,
+            column + "_" + self.df1_name,
+            column + "_" + self.df2_name,
         ]
         to_return = sample.select(return_cols)
 
         if for_display:
             return to_return.toDF(
-                [
+                *[
                     *self.join_columns,
-                    *[
-                        column + " (" + self.df1_name + ")",
-                        column + " (" + self.df2_name + ")",
-                    ],
+                    column + " (" + self.df1_name + ")",
+                    column + " (" + self.df2_name + ")",
                 ]
             )
         return to_return
@@ -986,7 +982,7 @@ def calculate_max_diff(dataframe: sp.DataFrame, col_1: str, col_2: str) -> float
             .collect()[0][0]
         )
     except SnowparkSQLException:
-        return 0
+        return None
 
     if pd.isna(max_diff) or pd.isnull(max_diff) or max_diff is None:
         return 0
@@ -1090,7 +1086,7 @@ def _generate_id_within_group(
         )
     else:
         return (
-            dataframe.select([*join_columns, ["__index"]])
+            dataframe.select(join_columns + ["__index"])  # noqa: RUF005
             .withColumn(
                 order_column_name,
                 row_number().over(Window.orderBy("__index").partitionBy(join_columns))
