@@ -44,7 +44,7 @@ from snowflake.snowpark.functions import (
     when,
 )
 
-from datacompy.base import BaseCompare, temp_column_name
+from datacompy.base import BaseCompare
 from datacompy.spark.sql import decimal_comparator
 
 LOG = logging.getLogger(__name__)
@@ -269,7 +269,7 @@ class SFTableCompare(BaseCompare):
             df2 = df2.withColumn("__index", monotonically_increasing_id())
 
             # Create order column for uniqueness of match
-            order_column = temp_column_name(df1, df2).upper()
+            order_column = temp_column_name(df1, df2)
             df1 = df1.join(
                 _generate_id_within_group(df1, temp_join_columns, order_column),
                 on="__index",
@@ -1147,3 +1147,33 @@ def _is_comparable(type1: str, type2: str) -> bool:
         or ("string" in type1 and type2 == "timestamp")
         or (type1 == "timestamp" and "string" in type2)
     )
+
+
+def temp_column_name(*dataframes) -> str:
+    """Get a temp column name that isn't included in columns of any dataframes.
+
+    Parameters
+    ----------
+    dataframes : list of DataFrames
+        The DataFrames to create a temporary column name for
+
+    Returns
+    -------
+    str
+        String column name that looks like '_temp_x' for some integer x
+    """
+    i = 0
+    columns = []
+    for dataframe in dataframes:
+        columns = columns + list(dataframe.columns)
+    columns = set(columns)
+
+    while True:
+        temp_column = f"_TEMP_{i}"
+        unique = True
+
+        if temp_column in columns:
+            i += 1
+            unique = False
+        if unique:
+            return temp_column

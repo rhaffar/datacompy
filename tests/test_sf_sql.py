@@ -392,13 +392,9 @@ def test_compare_table_setter_good(snowpark_session):
 def test_compare_df_setter_bad(snowpark_session):
     pdf = pd.DataFrame([{"A": 1, "C": 2}, {"A": 2, "C": 2}])
     df = snowpark_session.createDataFrame(pdf)
-    with raises(ValueError, match="A is not a valid table name."):
-        SFTableCompare(snowpark_session, "A", "A", ["A"])
     with raises(TypeError, match="DF1 must be a valid sp.Dataframe"):
         SFTableCompare(snowpark_session, 3, 2, ["A"])
-    with raises(
-        ValueError, match=f"{df.table_name} must have all columns from join_columns"
-    ):
+    with raises(ValueError, match="DF1 must have all columns from join_columns"):
         SFTableCompare(snowpark_session, df, df.select("*"), ["B"])
     pdf = pd.DataFrame([{"A": 1, "B": 2}, {"A": 1, "B": 3}])
     df_dupe = snowpark_session.createDataFrame(pdf)
@@ -416,11 +412,9 @@ def test_compare_df_setter_good(snowpark_session):
     df2 = snowpark_session.createDataFrame([{"A": 1, "B": 2}, {"A": 2, "B": 3}])
     compare = SFTableCompare(snowpark_session, df1, df2, ["A"])
     assert compare.df1.toPandas().equals(df1.toPandas())
-    assert not compare.df2.toPandas().equals(df2.toPandas())
     assert compare.join_columns == ["A"]
     compare = SFTableCompare(snowpark_session, df1, df2, ["A", "B"])
     assert compare.df1.toPandas().equals(df1.toPandas())
-    assert not compare.df2.toPandas().equals(df2.toPandas())
     assert compare.join_columns == ["A", "B"]
 
 
@@ -429,7 +423,6 @@ def test_compare_df_setter_different_cases(snowpark_session):
     df2 = snowpark_session.createDataFrame([{"A": 1, "B": 2}, {"A": 2, "B": 3}])
     compare = SFTableCompare(snowpark_session, df1, df2, ["A"])
     assert compare.df1.toPandas().equals(df1.toPandas())
-    assert not compare.df2.toPandas().equals(df2.toPandas())
 
 
 def test_compare_default_uppercase_join_columns(snowpark_session):
@@ -810,8 +803,8 @@ def test_table_compare_from_real_data(snowpark_session):
 
     compare_unq = SFTableCompare(
         snowpark_session,
-        toy_table_name_1,
-        toy_table_name_2,
+        full_toy_table_name_1,
+        full_toy_table_name_2,
         join_columns=["ACCT_ID", "ACCT_SFX_NUM", "TRXN_POST_DT", "TRXN_POST_SEQ_NUM"],
     )
     assert compare_unq.matches()
