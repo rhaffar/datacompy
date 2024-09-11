@@ -14,12 +14,13 @@
 # limitations under the License.
 
 """
-Compare two Snowflake Tables
+Compare two Snowpark SQL DataFrames and Snowflake tables.
 
 Originally this package was meant to provide similar functionality to
 PROC COMPARE in SAS - i.e. human-readable reporting on the difference between
 two dataframes.
 """
+
 import logging
 import os
 from copy import deepcopy
@@ -43,18 +44,10 @@ from snowflake.snowpark.functions import (
     when,
 )
 
-from datacompy.base import BaseCompare
+from datacompy.base import BaseCompare, temp_column_name
+from datacompy.spark.sql import decimal_comparator
 
 LOG = logging.getLogger(__name__)
-
-
-# Used for checking equality with decimal(X, Y) types. Otherwise treated as the string "decimal".
-def decimal_comparator():
-    class DecimalComparator(str):
-        def __eq__(self, other):
-            return len(other) >= 7 and other[0:7] == "decimal"
-
-    return DecimalComparator("decimal")
 
 
 NUMERIC_SNOWPARK_TYPES = [
@@ -69,9 +62,10 @@ NUMERIC_SNOWPARK_TYPES = [
 
 
 class SFTableCompare(BaseCompare):
-    """Comparison class to be used to compare whether two dataframes as equal.
+    """Comparison class to be used to compare whether two Snowpark dataframes are equal.
 
-    Both df1 and df2 should be dataframes containing all of the join_columns,
+    df1 and df2 can refer to either a Snowpark dataframe or the name of a valid Snowflake table.
+    The data structures which df1 and df2 represent must contain all of the join_columns,
     with unique column names. Differences between values are compared to
     abs_tol + rel_tol * abs(df2['value']).
 
@@ -90,15 +84,12 @@ class SFTableCompare(BaseCompare):
         Absolute tolerance between two values.
     rel_tol : float, optional
         Relative tolerance between two values.
-    df1_name : str, optional
-        A string name for the first dataframe.  This allows the reporting to
-        print out an actual name instead of "df1", and allows human users to
-        more easily track the dataframes.
-    df2_name : str, optional
-        A string name for the second dataframe
     ignore_spaces : bool, optional
         Flag to strip whitespace (including newlines) from string columns (including any join
-        columns)
+        columns).
+    cast_join_columns_upper : bool, optional
+        Uppercases joined columns, enabled by default as columns are by default uppercased in
+        Snowpark.
 
     Attributes
     ----------
@@ -117,15 +108,26 @@ class SFTableCompare(BaseCompare):
         abs_tol: float = 0,
         rel_tol: float = 0,
         ignore_spaces: bool = False,
+        cast_join_columns_upper=True,
     ) -> None:
         if join_columns is None:
-            raise Exception("join_columns cannot be None")
+            errmsg = "join_columns cannot be None"
+            raise ValueError(errmsg)
         elif not join_columns:
-            raise Exception("join_columns is empty")
+            errmsg = "join_columns is empty"
+            raise ValueError(errmsg)
         elif isinstance(join_columns, (str, int, float)):
-            self.join_columns = [str(join_columns)]
+            self.join_columns = (
+                [str(join_columns).upper()]
+                if cast_join_columns_upper
+                else [str(join_columns)]
+            )
         else:
-            self.join_columns = [str(col) for col in cast(List[str], join_columns)]
+            self.join_columns = (
+                [str(col).upper() for col in cast(List[str], join_columns)]
+                if cast_join_columns_upper
+                else [str(col) for col in cast(List[str], join_columns)]
+            )
 
         self._any_dupes: bool = False
         self.session = session
@@ -142,17 +144,18 @@ class SFTableCompare(BaseCompare):
 
     @property
     def df1(self) -> sp.DataFrame:
+        """Get the first dataframe."""
         return self._df1
 
     @df1.setter
     def df1(self, df1: Union[str, sp.DataFrame]) -> None:
-        """Check that it is a dataframe and has the join columns"""
+        """Check that df1 is either a Snowpark DF or the name of a valid Snowflake table."""
         if isinstance(df1, str):
             table_name = [table_comp.upper() for table_comp in df1.split(".")]
             if len(table_name) == 3:
                 self.df1_name = table_name[2]
             else:
-                errmsg = f"{df1} is not a valid table name."
+                errmsg = f"{df1} is not a valid table name. Be sure to include the target db and schema."
                 raise ValueError(errmsg)
             self._df1 = self.session.table(df1)
         else:
@@ -162,61 +165,63 @@ class SFTableCompare(BaseCompare):
 
     @property
     def df2(self) -> sp.DataFrame:
+        """Get the second dataframe."""
         return self._df2
 
     @df2.setter
     def df2(self, df2: Union[str, sp.DataFrame]) -> None:
-        """Check that it is a dataframe and has the join columns"""
+        """Check that df2 is either a Snowpark DF or the name of a valid Snowflake table."""
         if isinstance(df2, str):
+            table_name = [table_comp.upper() for table_comp in df2.split(".")]
+            if len(table_name) == 3:
+                self.df2_name = table_name[2]
+            else:
+                errmsg = f"{df2} is not a valid table name. Be sure to include the target db and schema."
+                raise ValueError(errmsg)
             self._df2 = self.session.table(df2)
-            try:
-                self.df2_name = self.df2.table_name.split(".")[2].upper()
-            except IndexError as e:
-                errmsg = f"Table {df2.table_name} is not a valid table."
-                raise ValueError(errmsg) from e
         else:
             self._df2 = df2
             self.df2_name = "DF2"
         self._validate_dataframe(self.df2, self.df2_name)
 
     def _validate_dataframe(self, df: sp.DataFrame, df_name: str) -> None:
-        """Check that it is a dataframe and has the join columns
+        """Validate the provided Snowpark dataframe.
+
+        The dataframe can either be a standalone Snowpark dataframe or a representative
+        of a Snowflake table - in the latter case we check that the table it represents
+        is a valid table by forcing a collection.
 
         Parameters
         ----------
-        df : snowflake.session.Table
-            Snowflake Snowpark table object
+        df : sp.DataFrame
+            Snowpark Dataframe (either directly instantiated or as a Snowpark Table object).
         """
         if not isinstance(df, sp.DataFrame):
             raise TypeError(f"{df_name} must be a valid sp.Dataframe")
-        try:
-            df.columns
-        except SnowparkSQLException as e:
-            errmsg = f"Table {df.table_name} does not exist."
-            raise ValueError(errmsg) from e
+        # Check that the dataframe actually exists by forcing collection
+        df.columns  # noqa: B018
         # Check if join_columns are present in the dataframe
         if not set(self.join_columns).issubset(set(df.columns)):
-            raise ValueError(f"{df.table_name} must have all columns from join_columns")
+            raise ValueError(f"{df_name} must have all columns from join_columns")
 
         if df.drop_duplicates(self.join_columns).count() < df.count():
             self._any_dupes = True
 
     def _compare(self, ignore_spaces: bool) -> None:
-        """Actually run the comparison.  This tries to run df1.equals(df2)
-        first so that if they're truly equal we can tell.
+        """Actually run the comparison.
 
         This method will log out information about what is different between
-        the two dataframes, and will also return a boolean.
+        the two dataframes.
         """
         LOG.info(f"Number of columns in common: {len(self.intersect_columns())}")
         LOG.debug("Checking column overlap")
-        for col in self.df1_unq_columns():
-            LOG.info(f"Column in df1 and not in df2: {col}")
+        for column in self.df1_unq_columns():
+            LOG.info(f"Column in df1 and not in df2: {column}")
         LOG.info(
             f"Number of columns in df1 and not in df2: {len(self.df1_unq_columns())}"
         )
-        for col in self.df2_unq_columns():
-            LOG.info(f"Column in df2 and not in df1: {col}")
+        for column in self.df2_unq_columns():
+            LOG.info(f"Column in df2 and not in df1: {column}")
         LOG.info(
             f"Number of columns in df2 and not in df1: {len(self.df2_unq_columns())}"
         )
@@ -229,26 +234,26 @@ class SFTableCompare(BaseCompare):
             LOG.info("df1 does not match df2")
 
     def df1_unq_columns(self) -> OrderedSet[str]:
-        """Get columns that are unique to df1"""
+        """Get columns that are unique to df1."""
         return cast(
             OrderedSet[str], OrderedSet(self.df1.columns) - OrderedSet(self.df2.columns)
         )
 
     def df2_unq_columns(self) -> OrderedSet[str]:
-        """Get columns that are unique to df2"""
+        """Get columns that are unique to df2."""
         return cast(
             OrderedSet[str], OrderedSet(self.df2.columns) - OrderedSet(self.df1.columns)
         )
 
     def intersect_columns(self) -> OrderedSet[str]:
-        """Get columns that are shared between the two dataframes"""
+        """Get columns that are shared between the two dataframes."""
         return OrderedSet(self.df1.columns) & OrderedSet(self.df2.columns)
 
     def _dataframe_merge(self, ignore_spaces: bool) -> None:
-        """Merge df1 to df2 on the join columns, to get df1 - df2, df2 - df1
-        and df1 & df2
+        """Merge df1 to df2 on the join columns.
 
-        Joins on the ``join_columns``.
+        Gets df1 - df2, df2 - df1, and df1 & df2
+        joining on the ``join_columns``.
         """
         LOG.debug("Outer joining")
 
@@ -264,7 +269,7 @@ class SFTableCompare(BaseCompare):
             df2 = df2.withColumn("__index", monotonically_increasing_id())
 
             # Create order column for uniqueness of match
-            order_column = temp_column_name(df1, df2)
+            order_column = temp_column_name(df1, df2).upper()
             df1 = df1.join(
                 _generate_id_within_group(df1, temp_join_columns, order_column),
                 on="__index",
@@ -284,14 +289,12 @@ class SFTableCompare(BaseCompare):
 
         if ignore_spaces:
             for column in self.join_columns:
-                if (
-                    "string"
-                    in [dtype for name, dtype in df1.dtypes if name == column][0]
+                if "string" in next(
+                    dtype for name, dtype in df1.dtypes if name == column
                 ):
                     df1 = df1.withColumn(column, trim(col(column)))
-                if (
-                    "string"
-                    in [dtype for name, dtype in df2.dtypes if name == column][0]
+                if "string" in next(
+                    dtype for name, dtype in df2.dtypes if name == column
                 ):
                     df2 = df2.withColumn(column, trim(col(column)))
 
@@ -316,7 +319,7 @@ class SFTableCompare(BaseCompare):
             """
         SELECT * FROM
         df1 FULL OUTER JOIN df2
-        ON     
+        ON
         """
             + on
         )
@@ -371,7 +374,7 @@ class SFTableCompare(BaseCompare):
         self.intersect_rows = self.intersect_rows.cache_result()
 
     def _intersect_compare(self, ignore_spaces: bool) -> None:
-        """Run the comparison on the intersect dataframe
+        """Run the comparison on the intersect dataframe.
 
         This loops through all columns that are shared between df1 and df2, and
         creates a column column_match which is True for matches, False
@@ -382,9 +385,6 @@ class SFTableCompare(BaseCompare):
         null_diff: int
         row_cnt = self.intersect_rows.count()
         for column in self.intersect_columns():
-            col1_dtype, _ = _get_column_dtypes(self.df1, column, column)
-            col2_dtype, _ = _get_column_dtypes(self.df2, column, column)
-
             if column in self.join_columns:
                 match_cnt = row_cnt
                 col_match = ""
@@ -409,7 +409,9 @@ class SFTableCompare(BaseCompare):
                     .count()
                 )
                 max_diff = calculate_max_diff(
-                    self.intersect_rows, col_1, col_2, col1_dtype, col2_dtype
+                    self.intersect_rows,
+                    col_1,
+                    col_2,
                 )
                 null_diff = calculate_null_diff(self.intersect_rows, col_1, col_2)
 
@@ -418,6 +420,9 @@ class SFTableCompare(BaseCompare):
             else:
                 match_rate = 0
             LOG.info(f"{column}: {match_cnt} / {row_cnt} ({match_rate:.2%}) match")
+
+            col1_dtype, _ = _get_column_dtypes(self.df1, column, column)
+            col2_dtype, _ = _get_column_dtypes(self.df2, column, column)
 
             self.column_stats.append(
                 {
@@ -439,11 +444,17 @@ class SFTableCompare(BaseCompare):
             )
 
     def all_columns_match(self) -> bool:
-        """Whether the columns all match in the dataframes"""
+        """Whether the columns all match in the dataframes.
+
+        Returns
+        -------
+        bool
+        True if all columns in df1 are in df2 and vice versa
+        """
         return self.df1_unq_columns() == self.df2_unq_columns() == set()
 
     def all_rows_overlap(self) -> bool:
-        """Whether the rows are all present in both dataframes
+        """Whether the rows are all present in both dataframes.
 
         Returns
         -------
@@ -454,7 +465,7 @@ class SFTableCompare(BaseCompare):
         return self.df1_unq_rows.count() == self.df2_unq_rows.count() == 0
 
     def count_matching_rows(self) -> int:
-        """Count the number of rows match (on overlapping fields)
+        """Count the number of rows match (on overlapping fields).
 
         Returns
         -------
@@ -476,7 +487,7 @@ class SFTableCompare(BaseCompare):
         return match_columns_count
 
     def intersect_rows_match(self) -> bool:
-        """Check whether the intersect rows all match"""
+        """Check whether the intersect rows all match."""
         actual_length = self.intersect_rows.count()
         return self.count_matching_rows() == actual_length
 
@@ -493,14 +504,11 @@ class SFTableCompare(BaseCompare):
         bool
             True or False if the dataframes match.
         """
-        if not ignore_extra_columns and not self.all_columns_match():
-            return False
-        elif not self.all_rows_overlap():
-            return False
-        elif not self.intersect_rows_match():
-            return False
-        else:
-            return True
+        return not (
+            (not ignore_extra_columns and not self.all_columns_match())
+            or not self.all_rows_overlap()
+            or not self.intersect_rows_match()
+        )
 
     def subset(self) -> bool:
         """Return True if dataframe 2 is a subset of dataframe 1.
@@ -514,19 +522,18 @@ class SFTableCompare(BaseCompare):
         bool
             True if dataframe 2 is a subset of dataframe 1.
         """
-        if not self.df2_unq_columns() == set():
-            return False
-        elif not self.df2_unq_rows.count() == 0:
-            return False
-        elif not self.intersect_rows_match():
-            return False
-        else:
-            return True
+        return not (
+            self.df2_unq_columns() != set()
+            or self.df2_unq_rows.count() != 0
+            or not self.intersect_rows_match()
+        )
 
     def sample_mismatch(
         self, column: str, sample_count: int = 10, for_display: bool = False
-    ) -> "sp.DataFrame":
-        """Returns a sample sub-dataframe which contains the identifying
+    ) -> sp.DataFrame:
+        """Return sample mismatches.
+
+        Gets a sub-dataframe which contains the identifying
         columns, and df1 and df2 versions of the column.
 
         Parameters
@@ -561,24 +568,31 @@ class SFTableCompare(BaseCompare):
         for c in self.join_columns:
             sample = sample.withColumnRenamed(c + "_" + self.df1_name, c)
 
-        return_cols = self.join_columns + [
-            column + "_" + self.df1_name,
-            column + "_" + self.df2_name,
+        return_cols = [
+            self.join_columns,
+            *[
+                column + "_" + self.df1_name,
+                column + "_" + self.df2_name,
+            ],
         ]
         to_return = sample.select(return_cols)
 
         if for_display:
             return to_return.toDF(
-                *self.join_columns
-                + [
-                    column + " (" + self.df1_name + ")",
-                    column + " (" + self.df2_name + ")",
+                [
+                    *self.join_columns,
+                    *[
+                        column + " (" + self.df1_name + ")",
+                        column + " (" + self.df2_name + ")",
+                    ],
                 ]
             )
         return to_return
 
-    def all_mismatch(self, ignore_matching_cols: bool = False) -> "sp.DataFrame":
-        """All rows with any columns that have a mismatch. Returns all df1 and df2 versions of the columns and join
+    def all_mismatch(self, ignore_matching_cols: bool = False) -> sp.DataFrame:
+        """Get all rows with any columns that have a mismatch.
+
+        Returns all df1 and df2 versions of the columns and join
         columns.
 
         Parameters
@@ -642,7 +656,9 @@ class SFTableCompare(BaseCompare):
         column_count: int = 10,
         html_file: Optional[str] = None,
     ) -> str:
-        """Returns a string representation of a report.  The representation can
+        """Return a string representation of a report.
+
+        The representation can
         then be printed or saved to a file.
 
         Parameters
@@ -705,7 +721,7 @@ class SFTableCompare(BaseCompare):
             "column_comparison.txt",
             len([col for col in self.column_stats if col["unequal_cnt"] > 0]),
             len([col for col in self.column_stats if col["unequal_cnt"] == 0]),
-            sum([col["unequal_cnt"] for col in self.column_stats]),
+            sum(col["unequal_cnt"] for col in self.column_stats),
         )
 
         match_stats = []
@@ -804,7 +820,9 @@ class SFTableCompare(BaseCompare):
 
 
 def render(filename: str, *fields: Union[int, float, str]) -> str:
-    """Renders out an individual template.  This basically just reads in a
+    """Render out an individual template.
+
+    This basically just reads in a
     template file, and applies ``.format()`` on the fields.
 
     Parameters
@@ -834,8 +852,9 @@ def columns_equal(
     abs_tol: float = 0,
     ignore_spaces: bool = False,
 ) -> sp.DataFrame:
-    """Compares two columns from a dataframe, returning a True/False series,
-    with the same index as column 1.
+    """Compare two columns from a dataframe.
+
+    Returns a True/False series with the same index as column 1.
 
     - Two nulls (np.nan) will evaluate to True.
     - A null and a non-null value will evaluate to False.
@@ -901,9 +920,7 @@ def columns_equal(
             )
     else:
         LOG.debug(
-            "Skipping {}({}) and {}({}), columns are not comparable".format(
-                col_1, base_dtype, col_2, compare_dtype
-            )
+            f"Skipping {col_1}({base_dtype}) and {col_2}({compare_dtype}), columns are not comparable"
         )
         dataframe = dataframe.withColumn(col_match, lit(False))
     return dataframe
@@ -912,7 +929,7 @@ def columns_equal(
 def get_merged_columns(
     original_df: sp.DataFrame, merged_df: sp.DataFrame, suffix: str
 ) -> List[str]:
-    """Gets the columns from an original dataframe, in the new merged dataframe
+    """Get the columns from an original dataframe, in the new merged dataframe.
 
     Parameters
     ----------
@@ -923,52 +940,25 @@ def get_merged_columns(
     suffix : str
         What suffix was used to distinguish when the original dataframe was
         overlapping with the other merged dataframe.
-    """
-    columns = []
-    for col in original_df.columns:
-        if col in merged_df.columns:
-            columns.append(col)
-        elif f"{col}_{suffix}" in merged_df.columns:
-            columns.append(f"{col}_{suffix}")
-        else:
-            raise ValueError("Column not found: %s", col)
-    return columns
-
-
-def temp_column_name(*dataframes: sp.DataFrame) -> str:
-    """Gets a temp column name that isn't included in columns of any dataframes
-
-    Parameters
-    ----------
-    dataframes : list of sp.DataFrame
-        The DataFrames to create a temporary column name for
 
     Returns
     -------
-    str
-        String column name that looks like '_temp_x' for some integer x
+    List[str]
+        Column list of the original dataframe pre suffix
     """
-    i = 0
     columns = []
-    for dataframe in dataframes:
-        columns = columns + list(dataframe.columns)
-    columns = set(columns)
-
-    while True:
-        temp_column = f"_TEMP_{i}"
-        unique = True
-
-        if temp_column in columns:
-            i += 1
-            unique = False
-        if unique:
-            return temp_column
+    for column in original_df.columns:
+        if column in merged_df.columns:
+            columns.append(column)
+        elif f"{column}_{suffix}" in merged_df.columns:
+            columns.append(f"{column}_{suffix}")
+        else:
+            raise ValueError("Column not found: %s", column)
+    return columns
 
 
-def calculate_max_diff(
-    dataframe: "sp.DataFrame", col_1: str, col_2: str, type1: str, type2: str
-) -> float:
-    """Get a maximum difference between two columns
+def calculate_max_diff(dataframe: sp.DataFrame, col_1: str, col_2: str) -> float:
+    """Get a maximum difference between two columns.
 
     Parameters
     ----------
@@ -978,28 +968,25 @@ def calculate_max_diff(
         The first column to look at
     col_2 : str
         The second column
-    type_1: str
-        The type of the first column
-    type_2: str
-        The type of the second column
 
     Returns
     -------
     float
         max diff
     """
-    # remove or no?    if not (type1 in NUMERIC_SNOWPARK_TYPES and type2 in NUMERIC_SNOWPARK_TYPES):
-    #        return 0
-
-    diff = dataframe.select(
-        (col(col_1).astype("float") - col(col_2).astype("float")).alias("diff")
-    )
-    abs_diff = diff.select(abs(col("diff")).alias("abs_diff"))
-    max_diff: float = (
-        abs_diff.where(is_null(col("abs_diff")) == False)  # noqa: E712
-        .agg({"abs_diff": "max"})
-        .collect()[0][0]
-    )
+    # Attempting to coalesce maximum diff for non-numeric results in error, if error return 0 max diff.
+    try:
+        diff = dataframe.select(
+            (col(col_1).astype("float") - col(col_2).astype("float")).alias("diff")
+        )
+        abs_diff = diff.select(abs(col("diff")).alias("abs_diff"))
+        max_diff: float = (
+            abs_diff.where(is_null(col("abs_diff")) == False)  # noqa: E712
+            .agg({"abs_diff": "max"})
+            .collect()[0][0]
+        )
+    except SnowparkSQLException:
+        return 0
 
     if pd.isna(max_diff) or pd.isnull(max_diff) or max_diff is None:
         return 0
@@ -1007,8 +994,8 @@ def calculate_max_diff(
         return max_diff
 
 
-def calculate_null_diff(dataframe: "sp.DataFrame", col_1: str, col_2: str) -> int:
-    """Get the null differences between two columns
+def calculate_null_diff(dataframe: sp.DataFrame, col_1: str, col_2: str) -> int:
+    """Get the null differences between two columns.
 
     Parameters
     ----------
@@ -1050,9 +1037,11 @@ def calculate_null_diff(dataframe: "sp.DataFrame", col_1: str, col_2: str) -> in
 
 
 def _generate_id_within_group(
-    dataframe: "sp.DataFrame", join_columns: List[str], order_column_name: str
-) -> "sp.DataFrame":
-    """Generate an ID column that can be used to deduplicate identical rows.  The series generated
+    dataframe: sp.DataFrame, join_columns: List[str], order_column_name: str
+) -> sp.DataFrame:
+    """Generate an ID column that can be used to deduplicate identical rows.
+
+    The series generated
     is the order within a unique group, and it handles nulls. Requires a ``__index`` column.
 
     Parameters
@@ -1089,7 +1078,7 @@ def _generate_id_within_group(
 
         return (
             dataframe.select(
-                *(col(c).cast("string").alias(c) for c in join_columns + ["__index"])
+                *(col(c).cast("string").alias(c) for c in [*join_columns, ["__index"]])
             )
             .fillna(default_value)
             .withColumn(
@@ -1101,7 +1090,7 @@ def _generate_id_within_group(
         )
     else:
         return (
-            dataframe.select(join_columns + ["__index"])
+            dataframe.select([*join_columns, ["__index"]])
             .withColumn(
                 order_column_name,
                 row_number().over(Window.orderBy("__index").partitionBy(join_columns))
@@ -1112,9 +1101,9 @@ def _generate_id_within_group(
 
 
 def _get_column_dtypes(
-    dataframe: "sp.DataFrame", col_1: "str", col_2: "str"
+    dataframe: sp.DataFrame, col_1: "str", col_2: "str"
 ) -> tuple[str, str]:
-    """Get the dtypes of two columns
+    """Get the dtypes of two columns.
 
     Parameters
     ----------
@@ -1130,13 +1119,13 @@ def _get_column_dtypes(
     Tuple(str, str)
         Tuple of base and compare datatype
     """
-    base_dtype = [d[1] for d in dataframe.dtypes if d[0] == col_1][0]
-    compare_dtype = [d[1] for d in dataframe.dtypes if d[0] == col_2][0]
+    base_dtype = next(d[1] for d in dataframe.dtypes if d[0] == col_1)
+    compare_dtype = next(d[1] for d in dataframe.dtypes if d[0] == col_2)
     return base_dtype, compare_dtype
 
 
 def _is_comparable(type1: str, type2: str) -> bool:
-    """Checks if two SnowPark data types can be safely compared.
+    """Check if two SnowPark data types can be safely compared.
 
     Two data types are considered comparable if any of the following apply:
         1. Both data types are the same

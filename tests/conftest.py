@@ -1,4 +1,5 @@
 """Testing configuration file, currently used for generating a Snowpark session for testing."""
+
 import os
 
 import pytest

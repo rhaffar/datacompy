@@ -28,20 +28,19 @@ from unittest import mock
 import numpy as np
 import pandas as pd
 import pytest
-from pandas.testing import assert_frame_equal
 from pytest import raises
 
 pytest.importorskip("pyspark")
 
-from pandas.testing import assert_series_equal  # noqa: E402
-
-from datacompy.sf_sql import (  # noqa: E402
+from datacompy.sf_sql import (
     SFTableCompare,
     _generate_id_within_group,
     calculate_max_diff,
     columns_equal,
     temp_column_name,
 )
+from pandas.testing import assert_series_equal
+from snowflake.snowpark.exceptions import SnowparkSQLException
 
 logging.basicConfig(stream=sys.stdout, level=logging.DEBUG)
 
@@ -342,6 +341,54 @@ def test_infinity_and_beyond(snowpark_session):
     assert_series_equal(expect_out, actual_out, check_names=False)
 
 
+def test_compare_table_setter_bad(snowpark_session):
+    # Invalid table name
+    with raises(ValueError, match="invalid_table_name_1 is not a valid table name."):
+        SFTableCompare(
+            snowpark_session, "invalid_table_name_1", "invalid_table_name_2", ["A"]
+        )
+    # Valid table name but table does not exist
+    with raises(SnowparkSQLException):
+        SFTableCompare(
+            snowpark_session, "non.existant.table_1", "non.existant.table_2", ["A"]
+        )
+
+
+def test_compare_table_setter_good(snowpark_session):
+    data = """ACCT_ID,DOLLAR_AMT,NAME,FLOAT_FLD,DATE_FLD
+    10000001234,123.4,George Michael Bluth,14530.155,
+    10000001235,0.45,Michael Bluth,,
+    10000001236,1345,George Bluth,1,
+    10000001237,123456,Robert Loblaw,345.12,
+    10000001238,1.05,Loose Seal Bluth,111,
+    10000001240,123.45,George Maharis,14530.1555,2017-01-02
+    """
+    df = pd.read_csv(StringIO(data), sep=",")
+    database = snowpark_session.get_current_database().replace('"', "")
+    schema = snowpark_session.get_current_schema().replace('"', "")
+    full_table_name = f"{database}.{schema}"
+    toy_table_name_1 = "DC_TOY_TABLE_1"
+    toy_table_name_2 = "DC_TOY_TABLE_2"
+    full_toy_table_name_1 = f"{full_table_name}.{toy_table_name_1}"
+    full_toy_table_name_2 = f"{full_table_name}.{toy_table_name_2}"
+
+    snowpark_session.write_pandas(
+        df, toy_table_name_1, table_type="temp", auto_create_table=True, overwrite=True
+    )
+    snowpark_session.write_pandas(
+        df, toy_table_name_2, table_type="temp", auto_create_table=True, overwrite=True
+    )
+
+    compare = SFTableCompare(
+        snowpark_session,
+        full_toy_table_name_1,
+        full_toy_table_name_2,
+        join_columns=["ACCT_ID"],
+    )
+    assert compare.df1.toPandas().equals(df)
+    assert compare.join_columns == ["ACCT_ID"]
+
+
 def test_compare_df_setter_bad(snowpark_session):
     pdf = pd.DataFrame([{"A": 1, "C": 2}, {"A": 2, "C": 2}])
     df = snowpark_session.createDataFrame(pdf)
@@ -383,6 +430,14 @@ def test_compare_df_setter_different_cases(snowpark_session):
     compare = SFTableCompare(snowpark_session, df1, df2, ["A"])
     assert compare.df1.toPandas().equals(df1.toPandas())
     assert not compare.df2.toPandas().equals(df2.toPandas())
+
+
+def test_compare_default_uppercase_join_columns(snowpark_session):
+    df1 = snowpark_session.createDataFrame([{"A": 1, "B": 2}, {"A": 2, "B": 2}])
+    df2 = snowpark_session.createDataFrame([{"A": 1, "B": 2}, {"A": 2, "B": 3}])
+    with raises(ValueError, match="DF1 must have all columns from join_columns"):
+        SFTableCompare(snowpark_session, df1, df2, ["a"], cast_join_columns_upper=False)
+    assert SFTableCompare(snowpark_session, df1, df2, ["a"])
 
 
 def test_columns_overlap(snowpark_session):
@@ -439,7 +494,8 @@ def test_columns_maintain_order_through_set_operations(snowpark_session):
 
 
 def test_10k_rows(snowpark_session):
-    pdf = pd.DataFrame(np.random.randint(0, 100, size=(10000, 2)), columns=["B", "C"])
+    rng = np.random.default_rng()
+    pdf = pd.DataFrame(rng.integers(0, 100, size=(10000, 2)), columns=["B", "C"])
     pdf.reset_index(inplace=True)
     pdf.columns = ["A", "B", "C"]
     pdf2 = pdf.copy()
@@ -489,7 +545,8 @@ def test_not_subset(snowpark_session, caplog):
 
 
 def test_large_subset(snowpark_session):
-    pdf = pd.DataFrame(np.random.randint(0, 100, size=(10000, 2)), columns=["B", "C"])
+    rng = np.random.default_rng()
+    pdf = pd.DataFrame(rng.integers(0, 100, size=(10000, 2)), columns=["B", "C"])
     pdf.reset_index(inplace=True)
     pdf.columns = ["A", "B", "C"]
     pdf2 = pdf[["A", "B"]].head(50).copy()
@@ -608,7 +665,7 @@ def test_temp_column_name_one_already(snowpark_session):
     assert actual == "_TEMP_0"
 
 
-### Duplicate testing!
+# Duplicate testing!
 
 
 def test_simple_dupes_one_field(snowpark_session):
@@ -704,6 +761,63 @@ def test_dupes_from_real_data(snowpark_session):
     compare_unq.report()
 
 
+def test_table_compare_from_real_data(snowpark_session):
+    data = """ACCT_ID,ACCT_SFX_NUM,TRXN_POST_DT,TRXN_POST_SEQ_NUM,TRXN_AMT,TRXN_DT,DEBIT_CR_CD,CASH_ADV_TRXN_COMN_CNTRY_CD,MRCH_CATG_CD,MRCH_PSTL_CD,VISA_MAIL_PHN_CD,VISA_RQSTD_PMT_SVC_CD,MC_PMT_FACILITATOR_IDN_NUM
+100,0,2017-06-17,1537019,30.64,2017-06-15,D,CAN,5812,M2N5P5,,,0.0
+200,0,2017-06-24,1022477,485.32,2017-06-22,D,USA,4511,7114,7.0,1,
+100,0,2017-06-17,1537039,2.73,2017-06-16,D,CAN,5812,M4J 1M9,,,0.0
+200,0,2017-06-29,1049223,22.41,2017-06-28,D,USA,4789,21211,,A,
+100,0,2017-06-17,1537029,34.05,2017-06-16,D,CAN,5812,M4E 2C7,,,0.0
+200,0,2017-06-29,1049213,9.12,2017-06-28,D,CAN,5814,0,,,
+100,0,2017-06-19,1646426,165.21,2017-06-17,D,CAN,5411,M4M 3H9,,,0.0
+200,0,2017-06-30,1233082,28.54,2017-06-29,D,USA,4121,94105,7.0,G,
+100,0,2017-06-19,1646436,17.87,2017-06-18,D,CAN,5812,M4J 1M9,,,0.0
+200,0,2017-06-30,1233092,24.39,2017-06-29,D,USA,4121,94105,7.0,G,
+100,0,2017-06-19,1646446,5.27,2017-06-17,D,CAN,5200,M4M 3G6,,,0.0
+200,0,2017-06-30,1233102,61.8,2017-06-30,D,CAN,4121,0,,,
+100,0,2017-06-20,1607573,41.99,2017-06-19,D,CAN,5661,M4C1M9,,,0.0
+200,0,2017-07-01,1009403,2.31,2017-06-29,D,USA,5814,22102,,F,
+100,0,2017-06-20,1607553,86.88,2017-06-19,D,CAN,4812,H2R3A8,,,0.0
+200,0,2017-07-01,1009423,5.5,2017-06-29,D,USA,5812,2903,,F,
+100,0,2017-06-20,1607563,25.17,2017-06-19,D,CAN,5641,M4C 1M9,,,0.0
+200,0,2017-07-01,1009433,214.12,2017-06-29,D,USA,3640,20170,,A,
+100,0,2017-06-20,1607593,1.67,2017-06-19,D,CAN,5814,M2N 6L7,,,0.0
+200,0,2017-07-01,1009393,2.01,2017-06-29,D,USA,5814,22102,,F,"""
+    df = pd.read_csv(StringIO(data), sep=",")
+    database = snowpark_session.get_current_database().replace('"', "")
+    schema = snowpark_session.get_current_schema().replace('"', "")
+    full_table_name = f"{database}.{schema}"
+    toy_table_name_1 = "DC_TOY_TABLE_1"
+    toy_table_name_2 = "DC_TOY_TABLE_2"
+    full_toy_table_name_1 = f"{full_table_name}.{toy_table_name_1}"
+    full_toy_table_name_2 = f"{full_table_name}.{toy_table_name_2}"
+
+    snowpark_session.write_pandas(
+        df, toy_table_name_1, table_type="temp", auto_create_table=True, overwrite=True
+    )
+    snowpark_session.write_pandas(
+        df, toy_table_name_2, table_type="temp", auto_create_table=True, overwrite=True
+    )
+
+    compare_acct = SFTableCompare(
+        snowpark_session,
+        full_toy_table_name_1,
+        full_toy_table_name_2,
+        join_columns=["ACCT_ID"],
+    )
+    assert compare_acct.matches()
+    compare_acct.report()
+
+    compare_unq = SFTableCompare(
+        snowpark_session,
+        toy_table_name_1,
+        toy_table_name_2,
+        join_columns=["ACCT_ID", "ACCT_SFX_NUM", "TRXN_POST_DT", "TRXN_POST_SEQ_NUM"],
+    )
+    assert compare_unq.matches()
+    compare_unq.report()
+
+
 def test_strings_with_joins_with_ignore_spaces(snowpark_session):
     df1 = snowpark_session.createDataFrame(
         [{"A": "HI", "B": " A"}, {"A": "BYE", "B": "A"}]
@@ -756,7 +870,7 @@ def test_strings_with_ignore_spaces_and_join_columns(snowpark_session):
         [{"A": "HI", "B": "A"}, {"A": "BYE", "B": "A"}]
     )
     df2 = snowpark_session.createDataFrame(
-        [{"A": " hi ", "B": "A"}, {"A": " bye ", "B": "A"}]
+        [{"A": " HI ", "B": "A"}, {"A": " BYE ", "B": "A"}]
     )
     compare = SFTableCompare(snowpark_session, df1, df2, "A", ignore_spaces=False)
     assert not compare.matches()
@@ -816,15 +930,15 @@ def test_sample_mismatch(snowpark_session):
 
     output = compare.sample_mismatch(column="NAME", sample_count=1).toPandas()
     assert output.shape[0] == 1
-    assert (output.name_df1 != output.name_df2).all()
+    assert (output.NAME_DF1 != output.NAME_DF2).all()
 
     output = compare.sample_mismatch(column="NAME", sample_count=2).toPandas()
     assert output.shape[0] == 2
-    assert (output.name_df1 != output.name_df2).all()
+    assert (output.NAME_DF1 != output.NAME_DF2).all()
 
     output = compare.sample_mismatch(column="NAME", sample_count=3).toPandas()
     assert output.shape[0] == 2
-    assert (output.name_df1 != output.name_df2).all()
+    assert (output.NAME_DF1 != output.NAME_DF2).all()
 
 
 def test_all_mismatch_not_ignore_matching_cols_no_cols_matching(snowpark_session):
@@ -853,17 +967,17 @@ def test_all_mismatch_not_ignore_matching_cols_no_cols_matching(snowpark_session
     assert output.shape[0] == 4
     assert output.shape[1] == 9
 
-    assert (output.name_df1 != output.name_df2).values.sum() == 2
-    assert (~(output.name_df1 != output.name_df2)).values.sum() == 2
+    assert (output.NAME_DF1 != output.NAME_DF2).values.sum() == 2
+    assert (~(output.NAME_DF1 != output.NAME_DF2)).values.sum() == 2
 
-    assert (output.dollar_amt_df1 != output.dollar_amt_df2).values.sum() == 1
-    assert (~(output.dollar_amt_df1 != output.dollar_amt_df2)).values.sum() == 3
+    assert (output.DOLLAR_AMT_DF1 != output.DOLLAR_AMT_DF2).values.sum() == 1
+    assert (~(output.DOLLAR_AMT_DF1 != output.DOLLAR_AMT_DF2)).values.sum() == 3
 
-    assert (output.float_fld_df1 != output.float_fld_df2).values.sum() == 3
-    assert (~(output.float_fld_df1 != output.float_fld_df2)).values.sum() == 1
+    assert (output.FLOAT_FLD_DF1 != output.FLOAT_FLD_DF2).values.sum() == 3
+    assert (~(output.FLOAT_FLD_DF1 != output.FLOAT_FLD_DF2)).values.sum() == 1
 
-    assert (output.date_fld_df1 != output.date_fld_df2).values.sum() == 4
-    assert (~(output.date_fld_df1 != output.date_fld_df2)).values.sum() == 0
+    assert (output.DATE_FLD_DF1 != output.DATE_FLD_DF2).values.sum() == 4
+    assert (~(output.DATE_FLD_DF1 != output.DATE_FLD_DF2)).values.sum() == 0
 
 
 def test_all_mismatch_not_ignore_matching_cols_some_cols_matching(snowpark_session):
@@ -893,17 +1007,17 @@ def test_all_mismatch_not_ignore_matching_cols_some_cols_matching(snowpark_sessi
     assert output.shape[0] == 4
     assert output.shape[1] == 9
 
-    assert (output.name_df1 != output.name_df2).values.sum() == 0
-    assert (~(output.name_df1 != output.name_df2)).values.sum() == 4
+    assert (output.NAME_DF1 != output.NAME_DF2).values.sum() == 0
+    assert (~(output.NAME_DF1 != output.NAME_DF2)).values.sum() == 4
 
-    assert (output.dollar_amt_df1 != output.dollar_amt_df2).values.sum() == 0
-    assert (~(output.dollar_amt_df1 != output.dollar_amt_df2)).values.sum() == 4
+    assert (output.DOLLAR_AMT_DF1 != output.DOLLAR_AMT_DF2).values.sum() == 0
+    assert (~(output.DOLLAR_AMT_DF1 != output.DOLLAR_AMT_DF2)).values.sum() == 4
 
-    assert (output.float_fld_df1 != output.float_fld_df2).values.sum() == 3
-    assert (~(output.float_fld_df1 != output.float_fld_df2)).values.sum() == 1
+    assert (output.FLOAT_FLD_DF1 != output.FLOAT_FLD_DF2).values.sum() == 3
+    assert (~(output.FLOAT_FLD_DF1 != output.FLOAT_FLD_DF2)).values.sum() == 1
 
-    assert (output.date_fld_df1 != output.date_fld_df2).values.sum() == 4
-    assert (~(output.date_fld_df1 != output.date_fld_df2)).values.sum() == 0
+    assert (output.DATE_FLD_DF1 != output.DATE_FLD_DF2).values.sum() == 4
+    assert (~(output.DATE_FLD_DF1 != output.DATE_FLD_DF2)).values.sum() == 0
 
 
 def test_all_mismatch_ignore_matching_cols_some_cols_matching_diff_rows(
@@ -937,11 +1051,11 @@ def test_all_mismatch_ignore_matching_cols_some_cols_matching_diff_rows(
     assert output.shape[0] == 4
     assert output.shape[1] == 5
 
-    assert (output.float_fld_df1 != output.float_fld_df2).values.sum() == 3
-    assert (~(output.float_fld_df1 != output.float_fld_df2)).values.sum() == 1
+    assert (output.FLOAT_FLD_DF1 != output.FLOAT_FLD_DF2).values.sum() == 3
+    assert (~(output.FLOAT_FLD_DF1 != output.FLOAT_FLD_DF2)).values.sum() == 1
 
-    assert (output.date_fld_df1 != output.date_fld_df2).values.sum() == 4
-    assert (~(output.date_fld_df1 != output.date_fld_df2)).values.sum() == 0
+    assert (output.DATE_FLD_DF1 != output.DATE_FLD_DF2).values.sum() == 4
+    assert (~(output.DATE_FLD_DF1 != output.DATE_FLD_DF2)).values.sum() == 0
 
     assert not ("NAME_DF1" in output and "NAME_DF2" in output)
     assert not ("DOLLAR_AMT_DF1" in output and "DOLLAR_AMT_DF1" in output)
@@ -975,11 +1089,11 @@ def test_all_mismatch_ignore_matching_cols_some_cols_matching(snowpark_session):
     assert output.shape[0] == 4
     assert output.shape[1] == 5
 
-    assert (output.float_fld_df1 != output.float_fld_df2).values.sum() == 3
-    assert (~(output.float_fld_df1 != output.float_fld_df2)).values.sum() == 1
+    assert (output.FLOAT_FLD_DF1 != output.FLOAT_FLD_DF2).values.sum() == 3
+    assert (~(output.FLOAT_FLD_DF1 != output.FLOAT_FLD_DF2)).values.sum() == 1
 
-    assert (output.date_fld_df1 != output.date_fld_df2).values.sum() == 4
-    assert (~(output.date_fld_df1 != output.date_fld_df2)).values.sum() == 0
+    assert (output.DATE_FLD_DF1 != output.DATE_FLD_DF2).values.sum() == 4
+    assert (~(output.DATE_FLD_DF1 != output.DATE_FLD_DF2)).values.sum() == 0
 
     assert not ("NAME_DF1" in output and "NAME_DF2" in output)
     assert not ("DOLLAR_AMT_DF1" in output and "DOLLAR_AMT_DF1" in output)
@@ -1011,17 +1125,17 @@ def test_all_mismatch_ignore_matching_cols_no_cols_matching(snowpark_session):
     assert output.shape[0] == 4
     assert output.shape[1] == 9
 
-    assert (output.name_df1 != output.name_df2).values.sum() == 2
-    assert (~(output.name_df1 != output.name_df2)).values.sum() == 2
+    assert (output.NAME_DF1 != output.NAME_DF2).values.sum() == 2
+    assert (~(output.NAME_DF1 != output.NAME_DF2)).values.sum() == 2
 
-    assert (output.dollar_amt_df1 != output.dollar_amt_df2).values.sum() == 1
-    assert (~(output.dollar_amt_df1 != output.dollar_amt_df2)).values.sum() == 3
+    assert (output.DOLLAR_AMT_DF1 != output.DOLLAR_AMT_DF2).values.sum() == 1
+    assert (~(output.DOLLAR_AMT_DF1 != output.DOLLAR_AMT_DF2)).values.sum() == 3
 
-    assert (output.float_fld_df1 != output.float_fld_df2).values.sum() == 3
-    assert (~(output.float_fld_df1 != output.float_fld_df2)).values.sum() == 1
+    assert (output.FLOAT_FLD_DF1 != output.FLOAT_FLD_DF2).values.sum() == 3
+    assert (~(output.FLOAT_FLD_DF1 != output.FLOAT_FLD_DF2)).values.sum() == 1
 
-    assert (output.date_fld_df1 != output.date_fld_df2).values.sum() == 4
-    assert (~(output.date_fld_df1 != output.date_fld_df2)).values.sum() == 0
+    assert (output.DATE_FLD_DF1 != output.DATE_FLD_DF2).values.sum() == 4
+    assert (~(output.DATE_FLD_DF1 != output.DATE_FLD_DF2)).values.sum() == 0
 
 
 @pytest.mark.parametrize(
@@ -1032,7 +1146,6 @@ def test_all_mismatch_ignore_matching_cols_no_cols_matching(snowpark_session):
         ("DECIMALS", 0.1),
         ("NULL_FLOATS", 0.1),
         ("STRINGS", 0.1),
-        ("MIXED_STRINGS", 1),
         ("INFINITY", np.inf),
     ],
 )
@@ -1050,16 +1163,12 @@ def test_calculate_max_diff(snowpark_session, column, expected):
             ],
             "NULL_FLOATS": [np.nan, 1.1, 1, 1, 1],
             "STRINGS": ["1", "1", "1", "1.1", "1"],
-            "MIXED_STRINGS": ["1", "1", "1", "2", "some string"],
             "INFINITY": [1, 1, 1, 1, np.inf],
         }
     )
     MAX_DIFF_DF = snowpark_session.createDataFrame(pdf)
-    type_dict = dict(MAX_DIFF_DF.dtypes)
     assert np.isclose(
-        calculate_max_diff(
-            MAX_DIFF_DF, "BASE", column, type_dict["BASE"], type_dict[column]
-        ),
+        calculate_max_diff(MAX_DIFF_DF, "BASE", column),
         expected,
     )
 
